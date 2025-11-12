@@ -5,7 +5,15 @@ from streamlit_webrtc import webrtc_streamer, WebRtcMode, AudioProcessorBase
 import av
 import threading
 import queue
-import time # Import time for a small delay if needed, though often not necessary
+import time 
+
+# --- STUN/TURN Server Configuration ---
+# This is the critical addition to solve connection issues.
+WEBRTC_CONFIGURATION = {
+    "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
+}
+# --- End STUN/TURN Config ---
+
 
 # --- Page Setup and Title ---
 st.set_page_config(page_title="AI Class Summarizer", page_icon="🎙️")
@@ -65,7 +73,6 @@ def speech_recognition_thread(recognizer):
         except sr.RequestError:
             pass
         except Exception:
-            # Catch other potential exceptions in the thread
             pass
         finally:
             audio_frames_queue.task_done()
@@ -74,40 +81,30 @@ def speech_recognition_thread(recognizer):
 class AudioProcessor(AudioProcessorBase):
     def __init__(self):
         self._recognizer = sr.Recognizer()
-        # Start the recognition thread only once
         self._recognition_thread = threading.Thread(target=speech_recognition_thread, args=(self._recognizer,))
         self._recognition_thread.daemon = True
         self._recognition_thread.start()
-        # Set a flag in session state that we are recording
         st.session_state.is_recording = True
 
     def recv(self, frame: av.AudioFrame) -> av.AudioFrame:
-        # Convert audio frame to raw data
         raw_samples = frame.to_ndarray()
         
-        # Create an AudioData object for speech_recognition
         audio_data = sr.AudioData(
             raw_samples.tobytes(),
             frame.sample_rate,
-            frame.layout.channels * 2  # 2 bytes per sample (assuming 16-bit)
+            frame.layout.channels * 2
         )
         
-        # Put the audio data into the queue for processing
         audio_frames_queue.put(audio_data)
         
         return frame
 
     def on_ended(self):
-        # This is the critical cleanup step
         st.session_state.is_recording = False
-        # Give the recognition thread a brief moment to process the last frame
         time.sleep(0.5) 
-        # Signal the recognition thread to stop when the stream ends
         audio_frames_queue.put(None)
         self._recognition_thread.join()
-        # Move the globally collected transcript to session state
         st.session_state.full_transcript = final_transcript_container["text"].strip()
-        # Ensure the transcript is NOT empty before a rerun
         if not st.session_state.full_transcript:
              st.session_state.full_transcript = "[No recognizable speech detected or transcription error occurred.]"
 
@@ -129,6 +126,8 @@ webrtc_ctx = webrtc_streamer(
     mode=WebRtcMode.SENDONLY,
     audio_processor_factory=AudioProcessor,
     media_stream_constraints={"video": False, "audio": True},
+    # PASS THE CONFIG HERE
+    rtc_configuration=WEBRTC_CONFIGURATION, 
 )
 
 st.markdown("##### Live Transcript")
@@ -136,7 +135,6 @@ transcript_placeholder = st.empty()
 
 # Update the placeholder with the live transcript while playing
 if webrtc_ctx.state.playing:
-    # Continuously refresh the placeholder with the current content of the global container
     transcript_placeholder.text_area("Your live transcript...", value=final_transcript_container["text"], height=200)
 
 # Display the next steps only after the streaming has stopped and we have a transcript.
@@ -151,7 +149,7 @@ if not webrtc_ctx.state.playing and st.session_state.full_transcript:
 
         with col1:
             if st.button("📝 Correct Transcript", use_container_width=True):
-                st.session_state.summary_text = None  # Clear any previous summary
+                st.session_state.summary_text = None
                 with st.spinner('Gemini is correcting the transcript...'):
                     try:
                         correction_prompt = f"Please correct any grammar or spelling errors in this lecture transcript: \"{st.session_state.full_transcript}\""
@@ -162,7 +160,7 @@ if not webrtc_ctx.state.playing and st.session_state.full_transcript:
 
         with col2:
             if st.button("✨ Generate Smart Summary", use_container_width=True):
-                st.session_state.corrected_text = None  # Clear any previous transcript
+                st.session_state.corrected_text = None
                 with st.spinner('Gemini is creating your intelligent study notes...'):
                     try:
                         summary_prompt = f"""
