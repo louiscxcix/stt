@@ -53,7 +53,9 @@ def get_refocus_plan_from_gemini(api_key, situation):
         ---
         User Input Situation: "{situation}"
     """
-    api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key={api_key}"
+    # Note: The model name in the URL might need updates based on the latest Gemini models.
+    # Check the Google AI documentation for the most current model endpoint.
+    api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key={api_key}"
     headers = {"Content-Type": "application/json"}
     data = {"contents": [{"parts": [{"text": prompt}]}]}
     try:
@@ -374,14 +376,15 @@ def main():
         unsafe_allow_html=True,
     )
 
-    try:
-        api_key = os.getenv("GEMINI_API_KEY")
-        if not api_key:
-             st.error("'GEMINI_API_KEY' is not set in your environment or Streamlit Secrets.")
-             st.stop()
-    except Exception:
-        st.error("'GEMINI_API_KEY' is not set in your environment or Streamlit Secrets.")
+    # --- EDITED SECTION FOR STREAMLIT SECRETS ---
+    # Check if the API key is available in Streamlit's secrets
+    if "GEMINI_API_KEY" in st.secrets:
+        api_key = st.secrets["GEMINI_API_KEY"]
+    else:
+        st.error("Gemini API key not found. Please add it to your Streamlit Secrets.")
+        st.info("To fix this, create a secrets.toml file with `GEMINI_API_KEY = 'Your_API_Key'` for local testing, or add it to your app's secrets on Streamlit Community Cloud.")
         st.stop()
+    # --- END OF EDITED SECTION ---
 
     with st.container():
         st.markdown('<div class="section">', unsafe_allow_html=True)
@@ -444,7 +447,7 @@ def main():
                         "process_explanation": process_explanation,
                     }
                 except (IndexError, ValueError) as e:
-                    st.error(f"An error occurred while processing the results: {e}")
+                    st.error(f"An error occurred while processing the results: {e}. Check the API response format.")
                     st.session_state.generated_plan = None
 
     if st.session_state.generated_plan:
