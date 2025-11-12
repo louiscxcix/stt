@@ -1,4 +1,3 @@
 streamlit
+requests
 google-generativeai
-SpeechRecognition
-streamlit-mic-recorder
