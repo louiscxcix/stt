@@ -4,7 +4,7 @@ import base64
 import time
 import pandas as pd
 import plotly.graph_objects as go
-from datetime import datetime, timedelta
+from datetime import datetime
 from Crypto.PublicKey import RSA
 from Crypto.Cipher import PKCS1_v1_5
 
@@ -73,7 +73,8 @@ class CapitalTradingBot:
         return None
 
     def get_candles(self, epic):
-        # Fetch last 30 minutes for context
+        # NOTE: Capital.com REST API minimum resolution is MINUTE.
+        # To simulate faster updates, we refresh the chart every 3 seconds.
         url = f"{self.base_url}/api/v1/prices/{epic}?resolution=MINUTE&max=30"
         headers = {'X-CAP-API-KEY': self.api_key, 'CST': self.cst, 'X-SECURITY-TOKEN': self.x_security_token}
         try:
@@ -127,9 +128,9 @@ class CapitalTradingBot:
             return False, resp.text
 
 # ==========================================
-# 2. STRATEGY ENGINE (Updated)
+# 2. STRATEGY ENGINE
 # ==========================================
-def run_strategy_logic(bot):
+def run_strategy_logic(bot, settings):
     epic = "ETHUSD"
     current_price = bot.get_price(epic)
     
@@ -143,8 +144,7 @@ def run_strategy_logic(bot):
         st.session_state.last_ref_update = now
         return f"🏁 Init Ref Price: ${current_price}"
 
-    # --- B. 10-MINUTE REFERENCE UPDATE ---
-    # Check if 10 minutes (600 seconds) have passed since last update
+    # --- B. 10-MINUTE TIMER ---
     time_diff = (now - st.session_state.last_ref_update).total_seconds()
     minutes_left = max(0, (600 - time_diff) / 60)
 
@@ -152,65 +152,105 @@ def run_strategy_logic(bot):
         old_ref = st.session_state.reference_price
         st.session_state.reference_price = current_price
         st.session_state.last_ref_update = now
-        st.toast(f"⏱️ 10m Passed. Ref Updated: {old_ref} -> {current_price}", icon="🔄")
-        return "🔄 Ref Price Updated (10m timer)"
+        st.toast(f"Ref Updated: {old_ref} -> {current_price}", icon="🔄")
+        return "🔄 Ref Price Updated (Timer)"
 
-    # --- C. CHECK BUY CONDITION (-0.3%) ---
-    # 0.3% Drop = Price * 0.997
-    drop_target = st.session_state.reference_price * 0.997 
+    # --- C. CHECK BUY CONDITION ---
+    # Retrieve user settings
+    drop_pct = settings['drop_percent']
+    drop_target = st.session_state.reference_price * (1 - (drop_pct / 100))
     
     if current_price <= drop_target:
-        # Check Limits
-        if st.session_state.total_invested >= 500:
-            return "🛑 Max Invest Limit Reached"
+        # Check Max Cap
+        if st.session_state.total_invested >= settings['max_invest']:
+            return "🛑 Max Investment Reached"
             
-        # Trade Config
-        investment = 50
-        leverage = 10
-        size = round((investment * leverage) / current_price, 2)
-        sl = round(current_price * 0.90, 2) # -10% Stop Loss
-        tp = round(current_price * 1.01, 2) # +1% Take Profit
+        # Calc Size
+        invest_amount = settings['invest_per_trade']
+        leverage = settings['leverage']
+        
+        # Size = (Invest * Lev) / Price
+        size = round((invest_amount * leverage) / current_price, 2)
+        
+        # SL / TP Prices
+        sl_pct = settings['sl_percent'] / 100
+        tp_pct = settings['tp_percent'] / 100
+        
+        sl_price = round(current_price * (1 - sl_pct), 2)
+        tp_price = round(current_price * (1 + tp_pct), 2)
         
         # Execute
-        success, ref = bot.place_order(epic, size, sl, tp)
+        success, ref = bot.place_order(epic, size, sl_price, tp_price)
         if success:
-            st.session_state.total_invested += investment
-            # Reset Reference after buy to prevent double-buying the same dip
-            st.session_state.reference_price = current_price 
+            st.session_state.total_invested += invest_amount
+            st.session_state.reference_price = current_price # Reset ref to avoid double buy
             st.session_state.last_ref_update = now
-            st.toast(f"BOUGHT ETH! {ref}", icon="🚀")
+            st.toast(f"BOUGHT! SL: {sl_price} TP: {tp_price}", icon="🚀")
             return "🚀 Trade Executed"
     
-    return f"⏳ Next Ref Update: {int(minutes_left)}m {int((minutes_left*60)%60)}s"
+    return f"Scanning... (Ref Update in {int(minutes_left)}m)"
 
 # ==========================================
-# 3. UI & CHARTING
+# 3. UI
 # ==========================================
 def main():
-    st.set_page_config(page_title="ETH 10m Bot", page_icon="⏱️", layout="wide")
+    st.set_page_config(page_title="ETH ProBot", page_icon="⚡", layout="wide")
 
     # Init State
     if 'bot' not in st.session_state:
         st.session_state.bot = CapitalTradingBot(is_demo=True)
         st.session_state.connected = False
         st.session_state.active = False
-        # Strategy Vars
         st.session_state.reference_price = None
         st.session_state.last_ref_update = datetime.now()
         st.session_state.total_invested = 0
 
     bot = st.session_state.bot
 
-    # --- SIDEBAR ---
+    # --- SIDEBAR: SETTINGS & CONTROLS ---
     with st.sidebar:
-        st.title("🎛️ Bot Control")
+        st.title("🎛️ Bot Settings")
+        
+        # 1. CONNECTION
         if not st.session_state.connected:
             if st.button("🔌 Connect", type="primary"):
                 if bot.connect():
                     st.session_state.connected = True
                     st.rerun()
         else:
-            st.success("🟢 Online")
+            st.success("🟢 Connected")
+            
+            # 2. STRATEGY CONFIG FORM
+            st.subheader("⚙️ Strategy Config")
+            with st.form("strategy_settings"):
+                drop_percent = st.number_input("Trigger Drop %", value=0.3, step=0.1)
+                st.caption(f"Buys when price drops {drop_percent}% below Reference.")
+                
+                c1, c2 = st.columns(2)
+                sl_percent = c1.number_input("Stop Loss %", value=10.0, step=0.5)
+                tp_percent = c2.number_input("Take Profit %", value=1.0, step=0.5)
+                
+                c3, c4 = st.columns(2)
+                max_invest = c3.number_input("Max Total Cap ($)", value=500, step=50)
+                invest_per_trade = c4.number_input("Amt Per Trade ($)", value=50, step=10)
+                
+                leverage = st.number_input("Leverage", value=10, step=1)
+                
+                apply_btn = st.form_submit_button("Update Settings")
+            
+            # Save settings to session state dictionary
+            settings = {
+                "drop_percent": drop_percent,
+                "sl_percent": sl_percent,
+                "tp_percent": tp_percent,
+                "max_invest": max_invest,
+                "invest_per_trade": invest_per_trade,
+                "leverage": leverage
+            }
+
+            st.divider()
+            
+            # 3. CONTROLS
             if st.session_state.active:
                 if st.button("🛑 STOP BOT", type="primary"):
                     st.session_state.active = False
@@ -227,38 +267,34 @@ def main():
                 st.rerun()
 
     # --- MAIN DASHBOARD ---
-    st.title("⚡ ETH/USD 10m-Interval Bot")
+    st.title("⚡ ETH/USD Pro-Trader")
 
     if not st.session_state.connected:
-        st.info("Connect via Sidebar to start.")
+        st.info("👈 Connect via Sidebar to start.")
         st.stop()
 
-    # 1. FETCH DATA
+    # FETCH DATA
     candles_df = bot.get_candles("ETHUSD")
     positions = bot.get_positions()
-    
-    # Calc P/L
     total_pl = sum([p['profitAndLoss'] for p in positions])
-
-    # 2. METRICS ROW
-    k1, k2, k3, k4 = st.columns(4)
     current_p = candles_df.iloc[-1]['Close'] if not candles_df.empty else 0
-    
+
+    # DISPLAY METRICS
+    k1, k2, k3, k4 = st.columns(4)
     k1.metric("Live Price", f"${current_p}")
     
-    # Show Reference and Target
     if st.session_state.reference_price:
         ref = st.session_state.reference_price
-        target = ref * 0.997
-        k2.metric("Ref / Target (-0.3%)", f"${ref:.2f}", f"Buy < ${target:.2f}")
+        target = ref * (1 - (settings['drop_percent']/100))
+        k2.metric(f"Ref / Buy < {settings['drop_percent']}%", f"${ref:.2f}", f"Target: ${target:.2f}")
     else:
-        k2.metric("Ref / Target", "Waiting for Start")
+        k2.metric("Ref Price", "Waiting...")
 
-    k3.metric("Total Invested", f"${st.session_state.total_invested}")
+    k3.metric("Total Invested", f"${st.session_state.total_invested}", f"Cap: ${settings['max_invest']}")
     k4.metric("Open P/L", f"${total_pl:.2f}", delta=total_pl)
 
-    # 3. LIVE CHART
-    st.subheader("📈 Live Market (1M Candles)")
+    # CHART
+    st.subheader("📈 Live Chart")
     if not candles_df.empty:
         fig = go.Figure(data=[go.Candlestick(
             x=candles_df['Time'],
@@ -267,40 +303,35 @@ def main():
             name="ETHUSD"
         )])
         
-        # Visualize the Logic
+        # Draw Lines if Active
         if st.session_state.reference_price:
-            # Reference Line (Grey)
-            fig.add_hline(y=st.session_state.reference_price, 
-                          line_dash="dot", line_color="gray", annotation_text="Ref Price")
-            # Buy Trigger Line (Green)
-            fig.add_hline(y=st.session_state.reference_price * 0.997, 
-                          line_dash="solid", line_color="green", annotation_text="BUY TARGET (-0.3%)")
+            fig.add_hline(y=st.session_state.reference_price, line_dash="dot", line_color="gray", annotation_text="Ref")
+            
+            target_p = st.session_state.reference_price * (1 - (settings['drop_percent']/100))
+            fig.add_hline(y=target_p, line_dash="solid", line_color="green", annotation_text="BUY")
 
         fig.update_layout(height=450, margin=dict(l=0, r=0, t=0, b=0), xaxis_rangeslider_visible=False)
         st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.warning("Fetching Chart Data...")
 
-    # 4. POSITIONS TABLE
+    # POSITIONS
     st.subheader(f"💼 Open Trades ({len(positions)})")
     if positions:
         pos_data = []
         for p in positions:
             pos_data.append({
                 "Date": p['createdDate'],
-                "Side": p['direction'],
-                "Size": p['size'],
+                "Amount": p['size'],
                 "Entry": p['openPrice'],
                 "Current": p['marketPrice'],
-                "P/L": p['profitAndLoss']
+                "P/L ($)": p['profitAndLoss']
             })
         st.dataframe(pd.DataFrame(pos_data), use_container_width=True)
 
-    # 5. AUTO LOOP
+    # AUTO LOOP
     if st.session_state.active:
-        status_msg = run_strategy_logic(bot)
-        st.caption(f"🤖 Status: {status_msg} | Last Check: {datetime.now().strftime('%H:%M:%S')}")
-        time.sleep(3) # Check every 3 seconds
+        status_msg = run_strategy_logic(bot, settings)
+        st.caption(f"🤖 Status: {status_msg} | Checked: {datetime.now().strftime('%H:%M:%S')}")
+        time.sleep(3) # Check every 3 seconds for faster updates
         st.rerun()
 
 if __name__ == "__main__":
