@@ -183,9 +183,9 @@ def run_strategy_logic(bot, settings, current_price, account_funds):
 
     # --- 0. SKIP SYNCING ---
     if st.session_state.skip_until and now < st.session_state.skip_until:
-        return "⏳ Syncing Order..."
+        return "⏳ Syncing..."
 
-    # 1. INITIAL SETUP
+    # 1. INITIAL SETUP (First Run)
     if st.session_state.reference_price is None:
         st.session_state.reference_price = current_price
         st.session_state.last_ref_update = now
@@ -206,58 +206,68 @@ def run_strategy_logic(bot, settings, current_price, account_funds):
 
     st.session_state.last_pos_count = len(current_positions)
 
-    # 3. CHECK UPDATE CONDITION
+    # 3. UPDATE REFERENCE (Only on 10m Timer)
     time_diff = (now - st.session_state.last_ref_update).total_seconds()
     timer_hit = time_diff >= 600
     
-    needs_update = False
     if timer_hit:
         st.session_state.reference_price = current_price
         st.session_state.last_ref_update = now
-        needs_update = True
 
-    # 4. ORDER MANAGEMENT
+    # 4. ORDER LOGIC
     orders = bot.get_working_orders()
-    has_eth_order = any(o.get('epic') == epic for o in orders)
-
-    # Cooldown Check
+    # Filter only ETH orders
+    eth_orders = [o for o in orders if o.get('epic') == epic]
+    
+    # --- COOLDOWN CHECK ---
     if st.session_state.last_fill_time:
         seconds_since_fill = (now - st.session_state.last_fill_time).total_seconds()
         if seconds_since_fill < 600:
             remaining = int(600 - seconds_since_fill)
             mins = remaining // 60
             secs = remaining % 60
-            if has_eth_order:
-                # Force delete any pending order during cooldown
-                for o in orders:
-                    if o.get('epic') == epic: bot.delete_order(o['dealId'])
+            # Ensure no orders exist during cooldown
+            if eth_orders:
+                for o in eth_orders: bot.delete_order(o['dealId'])
             return f"❄️ Cooldown: {mins}m {secs}s"
         else:
             st.session_state.last_fill_time = None
 
-    # PLACE / UPDATE ORDERS
-    if needs_update or not has_eth_order:
-        
-        # FUNDS CHECK
+    # --- CALCULATE TARGET PRICE ---
+    drop_pct = settings['drop_percent']
+    target_price = round(st.session_state.reference_price * (1 - (drop_pct / 100)), 2)
+
+    # --- IDEMPOTENCY CHECK (Prevent Loop) ---
+    order_needs_placement = False
+    
+    if not eth_orders:
+        # No order exists -> Must place one
+        order_needs_placement = True
+    elif len(eth_orders) > 1:
+        # Too many orders -> Clean up all and replace
+        for o in eth_orders: bot.delete_order(o['dealId'])
+        time.sleep(1)
+        order_needs_placement = True
+    else:
+        # Exactly one order exists. Check if price matches target.
+        existing_price = eth_orders[0].get('level')
+        # Allow tiny difference (floating point tolerance)
+        if abs(existing_price - target_price) > 0.05:
+            # Price mismatch (Ref updated) -> Delete and Replace
+            bot.delete_order(eth_orders[0]['dealId'])
+            time.sleep(1) # Wait for deletion
+            order_needs_placement = True
+        else:
+            # Order exists and is correct. DO NOTHING.
+            pass
+
+    # --- PLACE ORDER IF NEEDED ---
+    if order_needs_placement:
+        # Funds Check
         if account_funds < 300:
-            return f"🛑 Low Funds: €{account_funds:.2f} < €300"
+            return f"🛑 Low Funds: €{account_funds:.2f}"
 
-        # --- STEP 1: CLEANUP EXISTING ---
-        # Explicitly delete any existing order for this asset before placing a new one
-        deleted_something = False
-        for o in orders:
-            if o.get('epic') == epic: 
-                bot.delete_order(o['dealId'])
-                deleted_something = True
-        
-        # If we deleted an order, wait a moment for backend to process
-        if deleted_something:
-            time.sleep(1) 
-
-        # --- STEP 2: PLACE NEW ORDER ---
-        drop_pct = settings['drop_percent']
-        target_price = round(st.session_state.reference_price * (1 - (drop_pct / 100)), 2)
-        
+        # Size Calc
         invest_amount = settings['invest_per_trade']
         leverage = settings['leverage']
         size = round((invest_amount * leverage) / target_price, 2)
@@ -277,6 +287,8 @@ def run_strategy_logic(bot, settings, current_price, account_funds):
                     st.toast(f"✅ Limit Order Set @ ${target_price}", icon="🎯")
                     st.session_state.skip_until = now + timedelta(seconds=5)
                     return f"🎯 Limit Set @ {target_price}"
+                else:
+                    return f"❌ Error: {ref}"
             else:
                 return "🛑 Max Cap Reached"
 
