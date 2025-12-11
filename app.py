@@ -154,43 +154,56 @@ class CapitalTradingBot:
     def delete_order(self, deal_id):
         url = f"{self.base_url}/api/v1/workingorders/{deal_id}"
         headers = {'X-CAP-API-KEY': self.api_key, 'CST': self.cst, 'X-SECURITY-TOKEN': self.x_security_token}
-        self.session.delete(url, headers=headers)
+        return self.session.delete(url, headers=headers)
 
-    # --- UPDATED CLOSE ALL FUNCTION ---
-    def close_all_positions(self):
+    # --- AGGRESSIVE CLOSE ALL LOGIC ---
+    def force_close_all(self):
         headers = {'X-CAP-API-KEY': self.api_key, 'CST': self.cst, 'X-SECURITY-TOKEN': self.x_security_token}
-        
-        # 1. Close Open Trades
+        logs = []
+
+        # 1. DELETE PENDING ORDERS (Retry Loop)
+        for attempt in range(3):
+            orders = self.get_working_orders()
+            if not orders:
+                logs.append("✅ No pending orders found.")
+                break
+            
+            for o in orders:
+                deal_id = o.get('dealId')
+                url = f"{self.base_url}/api/v1/workingorders/{deal_id}"
+                resp = self.session.delete(url, headers=headers)
+                if resp.status_code == 200:
+                    logs.append(f"🗑️ Deleted Order {deal_id}")
+                else:
+                    logs.append(f"❌ Failed Order {deal_id}: {resp.status_code}")
+            
+            time.sleep(1) # Wait before checking again
+
+        # 2. DELETE ACTIVE POSITIONS
         positions = self.get_positions()
-        count_pos = 0
-        for p in positions:
-            url = f"{self.base_url}/api/v1/positions/{p.get('dealId')}"
-            if self.session.delete(url, headers=headers).status_code == 200:
-                count_pos += 1
-            time.sleep(0.1) # Buffer
-            
-        # 2. Cancel Pending Orders
-        orders = self.get_working_orders()
-        count_ord = 0
-        for o in orders:
-            url = f"{self.base_url}/api/v1/workingorders/{o.get('dealId')}"
-            if self.session.delete(url, headers=headers).status_code == 200:
-                count_ord += 1
-            time.sleep(0.1) # Buffer
-            
-        return f"✅ Closed {count_pos} Positions & Canceled {count_ord} Orders."
+        if not positions:
+            logs.append("✅ No active positions found.")
+        else:
+            for p in positions:
+                deal_id = p.get('dealId')
+                url = f"{self.base_url}/api/v1/positions/{deal_id}"
+                resp = self.session.delete(url, headers=headers)
+                if resp.status_code == 200:
+                    logs.append(f"📉 Closed Position {deal_id}")
+                else:
+                    logs.append(f"❌ Failed Position {deal_id}: {resp.status_code}")
+
+        return logs
 
 # ==========================================
-# 2. STRATEGY LOGIC (Triggered Only Every 10m)
+# 2. STRATEGY LOGIC
 # ==========================================
 def execute_strategy_update(bot, settings, current_price, account_funds):
     epic = "ETHUSD"
     
-    # 1. Funds Check
-    if account_funds < 300:
-        return "🛑 LOW FUNDS (<300)"
+    if account_funds < 300: return "🛑 LOW FUNDS (<300)"
 
-    # 2. Clean up Old Orders
+    # CLEANUP OLD ORDERS
     orders = bot.get_working_orders()
     deleted = False
     for o in orders:
@@ -198,22 +211,19 @@ def execute_strategy_update(bot, settings, current_price, account_funds):
             bot.delete_order(o['dealId'])
             deleted = True
     
-    if deleted: 
-        time.sleep(1) # Wait for deletion to register
+    if deleted: time.sleep(1)
 
-    # 3. Set New Reference & Target
+    # NEW ORDER CALC
     st.session_state.reference_price = current_price
     drop_pct = settings['drop_percent']
     target_price = round(current_price * (1 - (drop_pct / 100)), 2)
     
-    # 4. Calculate Size
     invest_amount = settings['invest_per_trade']
     leverage = settings['leverage']
     size = round((invest_amount * leverage) / target_price, 2)
     
     if size <= 0: return "❌ Size Error"
 
-    # 5. Risk Calc
     sl_dollar = settings['sl_amount']
     tp_dollar = settings['tp_amount']
     price_dist_sl = sl_dollar / size
@@ -222,11 +232,10 @@ def execute_strategy_update(bot, settings, current_price, account_funds):
     sl_price = round(target_price - price_dist_sl, 2)
     tp_price = round(target_price + price_dist_tp, 2)
 
-    # 6. Place New Order
     if st.session_state.total_invested < settings['max_invest']:
         success, ref = bot.place_limit_order(epic, size, target_price, sl_price, tp_price)
         if success:
-            st.toast(f"✅ New Limit Set: ${target_price}", icon="🎯")
+            st.toast(f"✅ Limit Set: ${target_price}", icon="🎯")
             return f"🎯 Limit Set: ${target_price}"
         else:
             return f"❌ Error: {ref}"
@@ -243,19 +252,15 @@ def main():
         st.session_state.bot = CapitalTradingBot(is_demo=True)
         st.session_state.connected = False
         st.session_state.active = False
-        
-        # Strategy State
         st.session_state.reference_price = None
+        st.session_state.last_ref_update = datetime.now()
         st.session_state.total_invested = 0
         st.session_state.last_pos_count = 0
-        
-        # TIME CONTROL
         st.session_state.next_update_time = None 
         st.session_state.status_msg = "Idle"
 
     bot = st.session_state.bot
 
-    # --- SIDEBAR ---
     with st.sidebar:
         st.title("🎛️ Settings")
         
@@ -296,17 +301,20 @@ def main():
             else:
                 if st.button("▶️ START BOT", type="secondary"):
                     st.session_state.active = True
-                    # Force update immediately on start
                     st.session_state.next_update_time = datetime.now()
                     st.rerun()
             
-            # --- UPDATED CLOSE ALL BUTTON ---
-            if st.button("🚨 CLOSE ALL (Trades + Orders)", type="primary"):
-                with st.spinner("Cancelling everything..."):
-                    res = bot.close_all_positions()
+            # --- FORCE CLOSE BUTTON ---
+            if st.button("🚨 FORCE CLOSE ALL", type="primary"):
+                with st.status("Executing Force Close...", expanded=True) as status:
+                    st.write("Fetching orders...")
+                    logs = bot.force_close_all()
+                    for log in logs:
+                        st.write(log)
+                    status.update(label="Cleanup Complete", state="complete")
+                    
                     st.session_state.total_invested = 0
-                    st.warning(res)
-                    time.sleep(2) # Give it time to display
+                    time.sleep(2)
             
             if st.button("Reset Memory"):
                 st.session_state.reference_price = None
@@ -314,7 +322,6 @@ def main():
                 st.session_state.next_update_time = None
                 st.rerun()
 
-    # --- MAIN DASHBOARD ---
     st.title("⚡ ETH/USD 10m-Cycle Bot")
 
     if not st.session_state.connected:
@@ -325,53 +332,42 @@ def main():
     account_ph = st.empty()
     chart_ph = st.empty()
     tab1, tab2 = st.tabs(["🔴 Live Monitor", "📜 Trade History"])
+    
+    with tab1:
+        live_table_ph = st.empty()
 
-    # --- MAIN LOOP (1 Second) ---
     while True:
-        # 1. Fetch High-Speed Data (Every second)
         candles_df = bot.get_candles("ETHUSD")
         current_p = bot.get_price("ETHUSD")
         positions = bot.get_positions()
         orders = bot.get_working_orders()
         account_data = bot.get_account_info()
         
-        # Account Parsing
         balance_obj = account_data.get('balance', {})
         equity = balance_obj.get('equity', 0)
         available = balance_obj.get('available', 0)
-        total_pl_acc = balance_obj.get('profitLoss', 0)
 
-        # Patch Chart with real-time tick
+        # Patch Chart
         if not candles_df.empty and current_p:
             candles_df.iloc[-1, candles_df.columns.get_loc('Close')] = current_p
             if current_p > candles_df.iloc[-1]['High']: candles_df.iloc[-1, candles_df.columns.get_loc('High')] = current_p
             if current_p < candles_df.iloc[-1]['Low']: candles_df.iloc[-1, candles_df.columns.get_loc('Low')] = current_p
 
-        # ==========================================
-        # CRITICAL: STRATEGY LOGIC (10 MINUTE CYCLE)
-        # ==========================================
+        # Strategy
         if st.session_state.active and current_p:
             now = datetime.now()
-            
-            # CONDITION 1: Time to Update (Every 10 mins)
             time_hit = st.session_state.next_update_time and now >= st.session_state.next_update_time
-            
-            # CONDITION 2: Trade Filled (Positions increased)
             filled = len(positions) > st.session_state.last_pos_count
             
             if time_hit or filled:
                 if filled: 
-                    st.toast("💰 Trade Filled! Resetting Cycle...", icon="🚀")
+                    st.toast("💰 Filled!", icon="🚀")
                     st.session_state.total_invested += settings['invest_per_trade']
                 
-                # EXECUTE ORDER SWAP
                 st.session_state.status_msg = execute_strategy_update(bot, settings, current_p, available)
-                
-                # SET NEXT UPDATE TIME (Now + 10 mins)
                 st.session_state.next_update_time = now + timedelta(minutes=10)
                 st.session_state.last_pos_count = len(positions)
             
-            # Update Countdown Msg
             if st.session_state.next_update_time:
                 remaining = (st.session_state.next_update_time - now).total_seconds()
                 mins = int(remaining // 60)
@@ -382,11 +378,7 @@ def main():
         else:
             countdown_msg = "Paused"
 
-        # ==========================================
-        # DISPLAY LOGIC (Every Second)
-        # ==========================================
-        
-        # P/L Calc
+        # Display Logic
         real_time_pl_total = 0
         active_trades_data = []
 
@@ -405,7 +397,6 @@ def main():
         for o in orders:
              active_trades_data.append({"Date": o.get('createdDate'), "Entry": f"LIMIT @ {o.get('level')}", "Size": o.get('size'), "Live P/L": "PENDING"})
 
-        # Metrics
         with metrics_ph.container():
             k1, k2, k3, k4 = st.columns(4)
             k1.metric("Live Price", f"${current_p}")
@@ -420,13 +411,11 @@ def main():
             a2.metric("Available Funds", f"€{available:,.2f}", delta_color=col)
             a3.metric("Account Status", f"{st.session_state.status_msg} {countdown_msg}")
 
-        # Chart
         if not candles_df.empty:
             fig = go.Figure(data=[go.Candlestick(x=candles_df['Time'], open=candles_df['Open'], high=candles_df['High'], low=candles_df['Low'], close=candles_df['Close'], name="ETHUSD")])
             for p in positions:
-                if p.get('openPrice'): fig.add_hline(y=p.get('openPrice'), line_dash="solid", line_color="blue", annotation_text="OPEN")
+                if p.get('openPrice'): fig.add_hline(y=p.get('openPrice'), line_dash="solid", line_color="blue")
             
-            # Show Target
             if st.session_state.reference_price:
                  target_p = st.session_state.reference_price * (1 - (settings['drop_percent']/100))
                  fig.add_hline(y=target_p, line_dash="dot", line_color="gray", annotation_text="Target")
@@ -434,13 +423,18 @@ def main():
             fig.update_layout(height=450, margin=dict(l=0, r=0, t=0, b=0), xaxis_rangeslider_visible=False)
             chart_ph.plotly_chart(fig, use_container_width=True, key=f"chart_{time.time()}")
 
-        with tab1:
-            if active_trades_data: st.dataframe(pd.DataFrame(active_trades_data), use_container_width=True)
-            else: st.info("No Active Trades")
+        if active_trades_data:
+            df = pd.DataFrame(active_trades_data)
+            live_table_ph.dataframe(df, use_container_width=True, hide_index=True)
+        else:
+            live_table_ph.info("No Active Trades")
         
         with tab2: st.caption("Manual Refresh Required")
 
         time.sleep(1)
+
+if __name__ == "__main__":
+    main()
 
 if __name__ == "__main__":
     main()
