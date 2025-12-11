@@ -144,6 +144,7 @@ class CapitalTradingBot:
         self.session.delete(url, headers=headers)
 
     def close_all_positions(self):
+        # 1. Close Positions
         positions = self.get_positions()
         count_pos = 0
         headers = {'X-CAP-API-KEY': self.api_key, 'CST': self.cst, 'X-SECURITY-TOKEN': self.x_security_token}
@@ -151,6 +152,7 @@ class CapitalTradingBot:
             url = f"{self.base_url}/api/v1/positions/{p.get('dealId')}"
             if self.session.delete(url, headers=headers).status_code == 200: count_pos += 1
             
+        # 2. Cancel Pending Orders
         orders = self.get_working_orders()
         count_ord = 0
         for o in orders:
@@ -173,13 +175,13 @@ def run_strategy_logic(bot, settings, current_price):
         st.session_state.reference_price = current_price
         st.session_state.last_ref_update = now
         st.session_state.last_pos_count = len(bot.get_positions())
-        st.session_state.last_fill_time = None # New variable for cooldown
+        st.session_state.last_fill_time = None
         return f"🏁 Init Ref: ${current_price}"
 
     # 2. DETECT ORDER FILL
     current_positions = bot.get_positions()
     if len(current_positions) > st.session_state.last_pos_count:
-        # A buy order was just executed!
+        # Trade detected!
         st.session_state.total_invested += settings['invest_per_trade']
         st.session_state.reference_price = current_price 
         st.session_state.last_ref_update = now
@@ -187,14 +189,12 @@ def run_strategy_logic(bot, settings, current_price):
         
         # START COOLDOWN
         st.session_state.last_fill_time = now
-        
         st.toast("🚀 LIMIT FILLED! Cooldown Started (10m)...", icon="❄️")
         return "💰 Filled! Entering Cooldown..."
 
     st.session_state.last_pos_count = len(current_positions)
 
     # 3. CHECK REFERENCE UPDATES
-    # We still track the reference even during cooldown
     time_diff = (now - st.session_state.last_ref_update).total_seconds()
     timer_hit = time_diff >= 600
     price_moved_up = current_price > st.session_state.reference_price
@@ -207,7 +207,9 @@ def run_strategy_logic(bot, settings, current_price):
 
     # 4. ORDER MANAGEMENT
     orders = bot.get_working_orders()
-    has_eth_order = any(o['epic'] == epic for o in orders)
+    
+    # FIX: Use .get() to prevent KeyError if 'epic' is missing
+    has_eth_order = any(o.get('epic') == epic for o in orders)
 
     # --- CHECK COOLDOWN ---
     if st.session_state.last_fill_time:
@@ -217,10 +219,10 @@ def run_strategy_logic(bot, settings, current_price):
             mins = remaining // 60
             secs = remaining % 60
             
-            # If we are in cooldown, we ensure NO pending orders exist
+            # Remove any lingering orders during cooldown
             if has_eth_order:
                 for o in orders:
-                    if o['epic'] == epic: bot.delete_order(o['dealId'])
+                    if o.get('epic') == epic: bot.delete_order(o['dealId'])
             
             return f"❄️ Cooldown Active: {mins}m {secs}s"
         else:
@@ -231,7 +233,7 @@ def run_strategy_logic(bot, settings, current_price):
     if needs_update or not has_eth_order:
         # Cancel old ones first
         for o in orders:
-            if o['epic'] == epic: bot.delete_order(o['dealId'])
+            if o.get('epic') == epic: bot.delete_order(o['dealId'])
         
         # Calculate new Limit
         drop_pct = settings['drop_percent']
@@ -369,6 +371,7 @@ def main():
         real_time_pl_total = 0
         display_data = []
 
+        # Process Active Positions
         for p in positions:
             entry = p.get('openPrice', 0)
             size = p.get('size', 0)
@@ -386,10 +389,11 @@ def main():
                 "P/L": f"${trade_pl:.2f}"
             })
         
-        # Add Pending Orders
+        # Process Pending Orders (FIXED KEY ERROR)
         pending_price = 0
-        eth_orders = [o for o in orders if o['epic'] == 'ETHUSD']
-        if eth_orders: pending_price = eth_orders[0]['level']
+        # Use .get() safely
+        eth_orders = [o for o in orders if o.get('epic') == 'ETHUSD']
+        if eth_orders: pending_price = eth_orders[0].get('level', 0)
 
         for o in orders:
              display_data.append({
@@ -399,7 +403,7 @@ def main():
                 "P/L": "-"
             })
 
-        # 4. Update Metrics
+        # 4. Metrics Update
         with metrics_ph.container():
             k1, k2, k3, k4 = st.columns(4)
             k1.metric("Live Price", f"${current_p}")
@@ -408,7 +412,7 @@ def main():
             k4.metric("Open P/L", f"${real_time_pl_total:.2f}", delta=real_time_pl_total)
             st.caption(f"Status: {status_msg}")
 
-        # 5. Update Chart
+        # 5. Chart Update
         if not candles_df.empty:
             fig = go.Figure(data=[go.Candlestick(
                 x=candles_df['Time'],
@@ -417,11 +421,9 @@ def main():
                 name="ETHUSD"
             )])
             
-            # Show Pending Level (Orange) or Target (Green)
             if pending_price > 0:
                 fig.add_hline(y=pending_price, line_dash="solid", line_color="orange", annotation_text="PENDING ORDER")
             elif st.session_state.last_fill_time:
-                # If Cooling down
                 fig.add_annotation(text="❄️ COOLDOWN", x=candles_df.iloc[-1]['Time'], y=current_p, showarrow=True, arrowhead=1)
             elif st.session_state.reference_price:
                  target_p = st.session_state.reference_price * (1 - (settings['drop_percent']/100))
@@ -430,7 +432,7 @@ def main():
             fig.update_layout(height=450, margin=dict(l=0, r=0, t=0, b=0), xaxis_rangeslider_visible=False)
             chart_ph.plotly_chart(fig, use_container_width=True, key=f"chart_{time.time()}")
 
-        # 6. Update Table
+        # 6. Table Update
         if display_data:
             table_ph.dataframe(pd.DataFrame(display_data), use_container_width=True)
         else:
