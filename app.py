@@ -123,8 +123,7 @@ class CapitalTradingBot:
             if resp.status_code == 200:
                 accounts = resp.json().get('accounts', [])
                 if accounts:
-                    # Return the primary account details
-                    return accounts[0]
+                    return accounts[0] # Returns the main account object
         except:
             return {}
         return {}
@@ -152,7 +151,6 @@ class CapitalTradingBot:
             'Content-Type': 'application/json'
         }
         
-        # 10m Expiry
         expiry_time = datetime.utcnow() + timedelta(minutes=10)
         expiry_str = expiry_time.strftime("%Y-%m-%dT%H:%M:%S")
 
@@ -202,7 +200,6 @@ class CapitalTradingBot:
                     logs.append(f"   ❌ Failed Order {did} (Code: {resp.status_code})")
             
             time.sleep(1)
-        
         return logs
 
 # ==========================================
@@ -211,8 +208,11 @@ class CapitalTradingBot:
 def execute_strategy_update(bot, settings, current_price, account_funds):
     epic = "ETHUSD"
     
-    if account_funds < 300: return "🛑 LOW FUNDS (<300)"
+    # 1. Available Funds Check
+    if account_funds < 300: 
+        return "🛑 LOW FUNDS (< €300)"
 
+    # 2. Cleanup Old Orders
     orders = bot.get_working_orders()
     deleted = False
     for o in orders:
@@ -222,16 +222,22 @@ def execute_strategy_update(bot, settings, current_price, account_funds):
     
     if deleted: time.sleep(1)
 
+    # 3. Calculate New Target
     st.session_state.reference_price = current_price
     drop_pct = settings['drop_percent']
     target_price = round(current_price * (1 - (drop_pct / 100)), 2)
     
+    # Save Target Price to State so UI can show it even if API is slow
+    st.session_state.current_target_price = target_price 
+
+    # 4. Calc Size
     invest_amount = settings['invest_per_trade']
     leverage = settings['leverage']
     size = round((invest_amount * leverage) / target_price, 2)
     
     if size <= 0: return "❌ Size Error"
 
+    # 5. Risk Params
     sl_dollar = settings['sl_amount']
     tp_dollar = settings['tp_amount']
     price_dist_sl = sl_dollar / size
@@ -240,15 +246,14 @@ def execute_strategy_update(bot, settings, current_price, account_funds):
     sl_price = round(target_price - price_dist_sl, 2)
     tp_price = round(target_price + price_dist_tp, 2)
 
-    if st.session_state.total_invested < settings['max_invest']:
-        success, ref = bot.place_limit_order(epic, size, target_price, sl_price, tp_price)
-        if success:
-            st.toast(f"✅ Limit Set: ${target_price}", icon="🎯")
-            return f"🎯 Limit Set: ${target_price}"
-        else:
-            return f"❌ Error: {ref}"
+    # 6. Place Order (Unlimited, trusted by funds check)
+    success, ref = bot.place_limit_order(epic, size, target_price, sl_price, tp_price)
+    if success:
+        st.toast(f"✅ Limit Set: ${target_price}", icon="🎯")
+        # Return simple status, removed price to declutter Account Status box
+        return "Active: Limit Placed" 
     else:
-        return "🛑 Max Cap"
+        return f"❌ Error: {ref}"
 
 # ==========================================
 # 3. UI
@@ -262,7 +267,7 @@ def main():
         st.session_state.active = False
         
         st.session_state.reference_price = None
-        st.session_state.total_invested = 0
+        st.session_state.current_target_price = 0.0 # UI helper
         st.session_state.last_pos_count = 0
         st.session_state.next_update_time = None 
         st.session_state.status_msg = "Idle"
@@ -291,15 +296,13 @@ def main():
                 sl_amount = c1.number_input("Max Loss", value=5.0)
                 tp_amount = c2.number_input("Target Profit", value=5.0)
                 st.write("**Capital**")
-                c3, c4 = st.columns(2)
-                max_invest = c3.number_input("Max Cap", value=500)
-                invest_per_trade = c4.number_input("Amt/Trade", value=50)
+                invest_per_trade = st.number_input("Amt/Trade", value=50)
                 leverage = st.number_input("Leverage", value=10)
                 st.form_submit_button("Update")
             
             settings = {
                 "drop_percent": drop_percent, "sl_amount": sl_amount, "tp_amount": tp_amount,
-                "max_invest": max_invest, "invest_per_trade": invest_per_trade, "leverage": leverage
+                "invest_per_trade": invest_per_trade, "leverage": leverage, "max_invest": 999999
             }
 
             st.divider()
@@ -319,8 +322,7 @@ def main():
                 status_box = st.status("Cancelling pending orders...", expanded=True)
                 logs = bot.cancel_all_pending_orders() 
                 for log in logs: status_box.write(log)
-                if "✅" in str(logs): status_box.update(label="Done", state="complete")
-                else: status_box.update(label="Finished", state="complete")
+                status_box.update(label="Done", state="complete")
                 time.sleep(1)
             
             if st.button("📜 Load History"):
@@ -333,7 +335,7 @@ def main():
 
             if st.button("Reset Memory"):
                 st.session_state.reference_price = None
-                st.session_state.total_invested = 0
+                st.session_state.current_target_price = 0.0
                 st.session_state.next_update_time = None
                 st.rerun()
 
@@ -353,7 +355,7 @@ def main():
 
     # --- MAIN LOOP (1 Second) ---
     while True:
-        # 1. Fetch
+        # 1. Fetch Data
         candles_df = bot.get_candles("ETHUSD")
         current_p = bot.get_price("ETHUSD")
         positions = bot.get_positions()
@@ -364,8 +366,8 @@ def main():
         balance_obj = account_data.get('balance', {})
         equity = balance_obj.get('equity', 0)
         available = balance_obj.get('available', 0)
-        # THIS IS THE OFFICIAL TOTAL P/L FROM THE BROKER
         total_account_pl = balance_obj.get('profitLoss', 0)
+        margin_used = balance_obj.get('margin', 0)
 
         # Patch Chart
         if not candles_df.empty and current_p:
@@ -380,9 +382,7 @@ def main():
             filled = len(positions) > st.session_state.last_pos_count
             
             if time_hit or filled:
-                if filled: 
-                    st.toast("💰 Filled!", icon="🚀")
-                    st.session_state.total_invested += settings['invest_per_trade']
+                if filled: st.toast("💰 Filled!", icon="🚀")
                 
                 st.session_state.status_msg = execute_strategy_update(bot, settings, current_p, available)
                 st.session_state.next_update_time = now + timedelta(minutes=10)
@@ -398,39 +398,49 @@ def main():
         else:
             countdown_msg = "Paused"
 
-        # Table Data
+        # Table Data & Limit Display Logic
         active_trades_data = []
         for p in positions:
             entry = p.get('openPrice', 0)
             size = p.get('size', 0)
-            # Individual P/L from API
             trade_pl = p.get('profitAndLoss', 0)
-            active_trades_data.append({"Date": p.get('createdDate'), "Entry": entry, "Size": size, "Live P/L": f"${trade_pl:.2f}"})
+            active_trades_data.append({"Date": p.get('createdDate'), "Entry": entry, "Size": size, "Live P/L": f"€{trade_pl:.2f}"})
         
+        # Pending Limit Logic (Sync with Status)
         pending_price = 0
         eth_orders = [o for o in orders if o.get('epic') == 'ETHUSD']
-        if eth_orders: pending_price = eth_orders[0].get('level', 0)
+        
+        if eth_orders: 
+            # Case 1: API confirms order exists
+            pending_price = eth_orders[0].get('level', 0)
+        elif st.session_state.status_msg.startswith("Active"):
+            # Case 2: API is slow, but we just placed it. Show our calculated target.
+            pending_price = st.session_state.current_target_price
 
         for o in orders:
              active_trades_data.append({"Date": o.get('createdDate'), "Entry": f"LIMIT @ {o.get('level')}", "Size": o.get('size'), "Live P/L": "PENDING"})
 
-        # --- METRICS DISPLAY (USING ACCOUNT TOTAL) ---
+        # --- METRICS DISPLAY (Corrected Currencies) ---
         with metrics_ph.container():
             k1, k2, k3, k4 = st.columns(4)
-            k1.metric("Live Price", f"${current_p}")
-            k2.metric("Pending Limit", f"${pending_price if pending_price > 0 else 'None'}")
-            k3.metric("Invested", f"${st.session_state.total_invested}", f"Limit: ${settings['max_invest']}")
+            k1.metric("Live Price (ETH/USD)", f"${current_p}")
+            k2.metric("Pending Limit Target", f"${pending_price if pending_price > 0 else 'None'}")
             
-            # FIXED: USING OFFICIAL ACCOUNT P/L
-            k4.metric("Open P/L", f"${total_account_pl:.2f}", delta=total_account_pl)
+            # EURO METRICS
+            k3.metric("Used Margin", f"€{margin_used:,.2f}")
+            k4.metric("Open P/L", f"€{total_account_pl:.2f}", delta=total_account_pl)
             
         with account_ph.container():
             a1, a2, a3 = st.columns(3)
+            # EURO METRICS
             a1.metric("Equity", f"€{equity:,.2f}")
             col = "normal" if available >= 300 else "inverse"
             a2.metric("Available Funds", f"€{available:,.2f}", delta_color=col)
-            a3.metric("Account Status", f"{st.session_state.status_msg} {countdown_msg}")
+            
+            # Status Box Cleaned
+            a3.metric("Bot Status", f"{st.session_state.status_msg} {countdown_msg}")
 
+        # Chart
         if not candles_df.empty:
             fig = go.Figure(data=[go.Candlestick(x=candles_df['Time'], open=candles_df['Open'], high=candles_df['High'], low=candles_df['Low'], close=candles_df['Close'], name="ETHUSD")])
             for p in positions:
