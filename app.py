@@ -73,7 +73,6 @@ class CapitalTradingBot:
         return None
 
     def get_candles(self, epic):
-        # Fetch Minute candles (lowest resolution available)
         url = f"{self.base_url}/api/v1/prices/{epic}?resolution=MINUTE&max=30"
         headers = {'X-CAP-API-KEY': self.api_key, 'CST': self.cst, 'X-SECURITY-TOKEN': self.x_security_token}
         try:
@@ -142,6 +141,8 @@ class CapitalTradingBot:
 # 2. STRATEGY ENGINE
 # ==========================================
 def run_strategy_logic(bot, settings, current_price):
+    if not current_price: return "Waiting for price..."
+    
     now = datetime.now()
 
     # --- A. INITIALIZATION ---
@@ -267,45 +268,60 @@ def main():
                 st.rerun()
 
     # --- MAIN DISPLAY ---
-    st.title("⚡ ETH/USD Live Dashboard")
+    st.title("⚡ ETH/USD Live Monitor")
 
     if not st.session_state.connected:
         st.info("👈 Connect to start.")
         st.stop()
 
-    # PLACEHOLDERS (For Real-Time Updates)
+    # PLACEHOLDERS
     metrics_ph = st.empty()
     chart_ph = st.empty()
     table_ph = st.empty()
 
-    # --- LOOP LOGIC ---
-    # If Active, we loop inside Python to avoid full page reload blinking
-    # If Not Active, we run once.
-    
-    run_loop = True
-    
-    while run_loop:
+    # --- MAIN LOOP (Always runs if connected) ---
+    while True:
         # 1. Fetch Data
         candles_df = bot.get_candles("ETHUSD")
         current_p = bot.get_price("ETHUSD")
         positions = bot.get_positions()
         
-        # Patch the chart: Make sure the last candle closes at the LIVE price
+        # Patch Chart with Live Price
         if not candles_df.empty and current_p:
             candles_df.iloc[-1, candles_df.columns.get_loc('Close')] = current_p
-            # Adjust High/Low if price broke out in this second
             if current_p > candles_df.iloc[-1]['High']: candles_df.iloc[-1, candles_df.columns.get_loc('High')] = current_p
             if current_p < candles_df.iloc[-1]['Low']: candles_df.iloc[-1, candles_df.columns.get_loc('Low')] = current_p
 
-        # 2. Strategy
-        status_msg = "Paused"
+        # 2. Strategy Logic (Only if Active)
         if st.session_state.active:
             status_msg = run_strategy_logic(bot, settings, current_p)
         else:
-            run_loop = False # Run once then stop if not active
+            status_msg = "Paused (Monitoring Only)"
 
-        # 3. Update Metrics
-        total_pl = sum([p['profitAndLoss'] for p in positions])
+        # 3. Calculate Real-Time P/L
+        # We manually calculate P/L using current price to ensure it updates every second
+        real_time_pl = 0
+        pos_display_data = []
+        
+        for p in positions:
+            entry = p.get('openPrice', 0)
+            size = p.get('size', 0)
+            # Basic P/L estimate: (Current - Entry) * Size
+            # Note: This is an estimate. Broker P/L includes fees/swap.
+            # We prefer broker P/L if available, but for visual speed, this helps.
+            broker_pl = p.get('profitAndLoss', 0)
+            
+            # Add to list
+            pos_display_data.append({
+                "Date": p.get('createdDate'), 
+                "Size": size, 
+                "Entry": entry, 
+                "Live Price": current_p,
+                "P/L": broker_pl
+            })
+            real_time_pl += broker_pl
+
+        # 4. Update Metrics
         with metrics_ph.container():
             k1, k2, k3, k4 = st.columns(4)
             k1.metric("Live Price", f"${current_p}")
@@ -318,10 +334,11 @@ def main():
                 k2.metric("Ref Price", "Waiting...")
 
             k3.metric("Invested", f"${st.session_state.total_invested}", f"Limit: ${settings['max_invest']}")
-            k4.metric("Open P/L", f"${total_pl:.2f}", delta=total_pl)
+            # Use delta to show P/L color (Green/Red)
+            k4.metric("Open P/L", f"${real_time_pl:.2f}", delta=real_time_pl)
             st.caption(f"Status: {status_msg}")
 
-        # 4. Update Chart
+        # 5. Update Chart
         if not candles_df.empty:
             fig = go.Figure(data=[go.Candlestick(
                 x=candles_df['Time'],
@@ -337,16 +354,14 @@ def main():
             fig.update_layout(height=450, margin=dict(l=0, r=0, t=0, b=0), xaxis_rangeslider_visible=False)
             chart_ph.plotly_chart(fig, use_container_width=True, key=f"chart_{time.time()}")
 
-        # 5. Update Table
-        if positions:
-            pos_data = [{"Date": p['createdDate'], "Size": p['size'], "Entry": p['openPrice'], "P/L": p['profitAndLoss']} for p in positions]
-            table_ph.dataframe(pd.DataFrame(pos_data), use_container_width=True)
+        # 6. Update Table
+        if pos_display_data:
+            table_ph.dataframe(pd.DataFrame(pos_display_data), use_container_width=True)
         else:
             table_ph.info("No Open Trades")
 
-        # 6. Sleep
-        if run_loop:
-            time.sleep(1)
+        # 7. Sleep 1s
+        time.sleep(1)
 
 if __name__ == "__main__":
     main()
