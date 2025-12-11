@@ -128,6 +128,23 @@ class CapitalTradingBot:
             return {}
         return {}
 
+    def get_history(self):
+        """Fetch last 24h trade activity"""
+        to_time = datetime.now()
+        from_time = to_time - timedelta(hours=24)
+        fmt = "%Y-%m-%dT%H:%M:%S"
+        
+        url = f"{self.base_url}/api/v1/history/activity?from={from_time.strftime(fmt)}&to={to_time.strftime(fmt)}"
+        headers = {'X-CAP-API-KEY': self.api_key, 'CST': self.cst, 'X-SECURITY-TOKEN': self.x_security_token}
+        
+        try:
+            resp = self.session.get(url, headers=headers)
+            if resp.status_code == 200:
+                return resp.json().get('activity', [])
+        except:
+            return []
+        return []
+
     def place_limit_order(self, epic, size, level, stop_loss, take_profit):
         url = f"{self.base_url}/api/v1/workingorders"
         headers = {
@@ -136,6 +153,11 @@ class CapitalTradingBot:
             'X-SECURITY-TOKEN': self.x_security_token,
             'Content-Type': 'application/json'
         }
+        
+        # 10m Expiry
+        expiry_time = datetime.utcnow() + timedelta(minutes=10)
+        expiry_str = expiry_time.strftime("%Y-%m-%dT%H:%M:%S")
+
         payload = {
             "epic": epic,
             "direction": "BUY",
@@ -143,8 +165,11 @@ class CapitalTradingBot:
             "level": level,
             "size": size,
             "stopLevel": stop_loss,
-            "profitLevel": take_profit
+            "profitLevel": take_profit,
+            "validity": "GOOD_TILL_DATE",
+            "goodTillDate": expiry_str
         }
+        
         resp = self.session.post(url, json=payload, headers=headers)
         if resp.status_code == 200:
             return True, resp.json()['dealReference']
@@ -156,43 +181,34 @@ class CapitalTradingBot:
         headers = {'X-CAP-API-KEY': self.api_key, 'CST': self.cst, 'X-SECURITY-TOKEN': self.x_security_token}
         return self.session.delete(url, headers=headers)
 
-    # --- AGGRESSIVE CLOSE ALL LOGIC ---
-    def force_close_all(self):
+    def force_close_all_persistent(self):
         headers = {'X-CAP-API-KEY': self.api_key, 'CST': self.cst, 'X-SECURITY-TOKEN': self.x_security_token}
         logs = []
-
-        # 1. DELETE PENDING ORDERS (Retry Loop)
-        for attempt in range(3):
+        
+        max_retries = 5 
+        for i in range(max_retries):
             orders = self.get_working_orders()
-            if not orders:
-                logs.append("✅ No pending orders found.")
-                break
+            positions = self.get_positions()
             
+            if not orders and not positions:
+                logs.append("✅ All Clear.")
+                return logs
+            
+            logs.append(f"🔄 Pass {i+1}: Found {len(orders)} Orders, {len(positions)} Positions")
+
             for o in orders:
-                deal_id = o.get('dealId')
-                url = f"{self.base_url}/api/v1/workingorders/{deal_id}"
+                did = o.get('dealId')
+                url = f"{self.base_url}/api/v1/workingorders/{did}"
                 resp = self.session.delete(url, headers=headers)
-                if resp.status_code == 200:
-                    logs.append(f"🗑️ Deleted Order {deal_id}")
-                else:
-                    logs.append(f"❌ Failed Order {deal_id}: {resp.status_code}")
+                logs.append(f"   Del Order {did}: {resp.status_code}")
             
-            time.sleep(1) # Wait before checking again
-
-        # 2. DELETE ACTIVE POSITIONS
-        positions = self.get_positions()
-        if not positions:
-            logs.append("✅ No active positions found.")
-        else:
             for p in positions:
-                deal_id = p.get('dealId')
-                url = f"{self.base_url}/api/v1/positions/{deal_id}"
+                did = p.get('dealId')
+                url = f"{self.base_url}/api/v1/positions/{did}"
                 resp = self.session.delete(url, headers=headers)
-                if resp.status_code == 200:
-                    logs.append(f"📉 Closed Position {deal_id}")
-                else:
-                    logs.append(f"❌ Failed Position {deal_id}: {resp.status_code}")
-
+                logs.append(f"   Del Pos {did}: {resp.status_code}")
+            
+            time.sleep(2)
         return logs
 
 # ==========================================
@@ -203,7 +219,6 @@ def execute_strategy_update(bot, settings, current_price, account_funds):
     
     if account_funds < 300: return "🛑 LOW FUNDS (<300)"
 
-    # CLEANUP OLD ORDERS
     orders = bot.get_working_orders()
     deleted = False
     for o in orders:
@@ -213,7 +228,6 @@ def execute_strategy_update(bot, settings, current_price, account_funds):
     
     if deleted: time.sleep(1)
 
-    # NEW ORDER CALC
     st.session_state.reference_price = current_price
     drop_pct = settings['drop_percent']
     target_price = round(current_price * (1 - (drop_pct / 100)), 2)
@@ -235,7 +249,7 @@ def execute_strategy_update(bot, settings, current_price, account_funds):
     if st.session_state.total_invested < settings['max_invest']:
         success, ref = bot.place_limit_order(epic, size, target_price, sl_price, tp_price)
         if success:
-            st.toast(f"✅ Limit Set: ${target_price}", icon="🎯")
+            st.toast(f"✅ New Limit Set: ${target_price}", icon="🎯")
             return f"🎯 Limit Set: ${target_price}"
         else:
             return f"❌ Error: {ref}"
@@ -252,15 +266,17 @@ def main():
         st.session_state.bot = CapitalTradingBot(is_demo=True)
         st.session_state.connected = False
         st.session_state.active = False
+        
         st.session_state.reference_price = None
-        st.session_state.last_ref_update = datetime.now()
         st.session_state.total_invested = 0
         st.session_state.last_pos_count = 0
         st.session_state.next_update_time = None 
         st.session_state.status_msg = "Idle"
+        st.session_state.history_data = [] # To store history table
 
     bot = st.session_state.bot
 
+    # --- SIDEBAR ---
     with st.sidebar:
         st.title("🎛️ Settings")
         
@@ -268,6 +284,7 @@ def main():
             if st.button("🔌 Connect", type="primary"):
                 if bot.connect():
                     st.session_state.connected = True
+                    st.session_state.last_pos_count = len(bot.get_positions())
                     st.rerun()
         else:
             st.success("🟢 Connected")
@@ -304,18 +321,32 @@ def main():
                     st.session_state.next_update_time = datetime.now()
                     st.rerun()
             
-            # --- FORCE CLOSE BUTTON ---
             if st.button("🚨 FORCE CLOSE ALL", type="primary"):
-                with st.status("Executing Force Close...", expanded=True) as status:
-                    st.write("Fetching orders...")
-                    logs = bot.force_close_all()
-                    for log in logs:
-                        st.write(log)
-                    status.update(label="Cleanup Complete", state="complete")
-                    
+                status_box = st.status("Cleaning up...", expanded=True)
+                logs = bot.force_close_all_persistent()
+                for log in logs: status_box.write(log)
+                if "✅ All Clear" in str(logs):
+                    status_box.update(label="✅ Closed.", state="complete")
                     st.session_state.total_invested = 0
-                    time.sleep(2)
+                    st.session_state.last_pos_count = 0
+                else: status_box.update(label="⚠️ Check logs", state="error")
+                time.sleep(1)
             
+            # --- HISTORY BUTTON (Updates Session State) ---
+            if st.button("📜 Load History"):
+                with st.spinner("Fetching last 24h..."):
+                    raw_hist = bot.get_history()
+                    # Process simple view
+                    clean_hist = []
+                    for h in raw_hist:
+                        clean_hist.append({
+                            "Date": h.get('date'),
+                            "Status": h.get('status'),
+                            "Desc": h.get('description'),
+                            "P/L": h.get('profitAndLoss')
+                        })
+                    st.session_state.history_data = clean_hist
+
             if st.button("Reset Memory"):
                 st.session_state.reference_price = None
                 st.session_state.total_invested = 0
@@ -333,10 +364,16 @@ def main():
     chart_ph = st.empty()
     tab1, tab2 = st.tabs(["🔴 Live Monitor", "📜 Trade History"])
     
-    with tab1:
-        live_table_ph = st.empty()
+    with tab1: live_table_ph = st.empty()
+    
+    # --- HISTORY TAB PLACEHOLDER ---
+    # We initialize this ONCE outside the loop
+    with tab2: 
+        history_ph = st.empty()
 
+    # --- MAIN LOOP (1 Second) ---
     while True:
+        # 1. Fetch
         candles_df = bot.get_candles("ETHUSD")
         current_p = bot.get_price("ETHUSD")
         positions = bot.get_positions()
@@ -353,7 +390,9 @@ def main():
             if current_p > candles_df.iloc[-1]['High']: candles_df.iloc[-1, candles_df.columns.get_loc('High')] = current_p
             if current_p < candles_df.iloc[-1]['Low']: candles_df.iloc[-1, candles_df.columns.get_loc('Low')] = current_p
 
-        # Strategy
+        # ==========================================
+        # CRITICAL STRATEGY LOGIC
+        # ==========================================
         if st.session_state.active and current_p:
             now = datetime.now()
             time_hit = st.session_state.next_update_time and now >= st.session_state.next_update_time
@@ -385,8 +424,7 @@ def main():
         for p in positions:
             entry = p.get('openPrice', 0)
             size = p.get('size', 0)
-            if current_p and entry: trade_pl = (current_p - entry) * size
-            else: trade_pl = 0
+            trade_pl = p.get('profitAndLoss', 0) # USE API P/L
             real_time_pl_total += trade_pl
             active_trades_data.append({"Date": p.get('createdDate'), "Entry": entry, "Size": size, "Live P/L": f"${trade_pl:.2f}"})
         
@@ -423,18 +461,22 @@ def main():
             fig.update_layout(height=450, margin=dict(l=0, r=0, t=0, b=0), xaxis_rangeslider_visible=False)
             chart_ph.plotly_chart(fig, use_container_width=True, key=f"chart_{time.time()}")
 
+        # Update Live Table (Using Placeholder)
         if active_trades_data:
             df = pd.DataFrame(active_trades_data)
             live_table_ph.dataframe(df, use_container_width=True, hide_index=True)
         else:
             live_table_ph.info("No Active Trades")
         
-        with tab2: st.caption("Manual Refresh Required")
+        # Update History Table (Using Placeholder)
+        if st.session_state.history_data:
+            history_ph.dataframe(pd.DataFrame(st.session_state.history_data), use_container_width=True, hide_index=True)
+        else:
+            history_ph.caption("No history loaded. Click 'Load History' in sidebar.")
 
         time.sleep(1)
 
 if __name__ == "__main__":
     main()
-
 if __name__ == "__main__":
     main()
