@@ -1,5 +1,2 @@
-streamlit
-google-generativeai
-SpeechRecognition
-streamlit-webrtc
-av
+requests
+pycryptodome
