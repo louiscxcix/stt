@@ -165,27 +165,34 @@ def run_strategy_logic(bot, settings):
         if st.session_state.total_invested >= settings['max_invest']:
             return "🛑 Max Investment Reached"
             
-        # Calc Size
+        # 1. Calculate Position Size
         invest_amount = settings['invest_per_trade']
         leverage = settings['leverage']
-        
-        # Size = (Invest * Lev) / Price
+        # Size (Units) = (Invest * Lev) / Price
         size = round((invest_amount * leverage) / current_price, 2)
         
-        # SL / TP Prices
-        sl_pct = settings['sl_percent'] / 100
-        tp_pct = settings['tp_percent'] / 100
+        if size <= 0: return "❌ Size too small"
+
+        # 2. Calculate SL / TP Levels based on Dollar Amount
+        # Profit = (Exit Price - Entry Price) * Size
+        # Therefore: Price Distance = Profit / Size
         
-        sl_price = round(current_price * (1 - sl_pct), 2)
-        tp_price = round(current_price * (1 + tp_pct), 2)
+        sl_dollar = settings['sl_amount']
+        tp_dollar = settings['tp_amount']
+        
+        price_dist_sl = sl_dollar / size
+        price_dist_tp = tp_dollar / size
+        
+        sl_price = round(current_price - price_dist_sl, 2)
+        tp_price = round(current_price + price_dist_tp, 2)
         
         # Execute
         success, ref = bot.place_order(epic, size, sl_price, tp_price)
         if success:
             st.session_state.total_invested += invest_amount
-            st.session_state.reference_price = current_price # Reset ref to avoid double buy
+            st.session_state.reference_price = current_price # Reset ref
             st.session_state.last_ref_update = now
-            st.toast(f"BOUGHT! SL: {sl_price} TP: {tp_price}", icon="🚀")
+            st.toast(f"BOUGHT! Risking ${sl_dollar} to make ${tp_dollar}", icon="🚀")
             return "🚀 Trade Executed"
     
     return f"Scanning... (Ref Update in {int(minutes_left)}m)"
@@ -223,26 +230,28 @@ def main():
             # 2. STRATEGY CONFIG FORM
             st.subheader("⚙️ Strategy Config")
             with st.form("strategy_settings"):
-                drop_percent = st.number_input("Trigger Drop %", value=0.3, step=0.1)
-                st.caption(f"Buys when price drops {drop_percent}% below Reference.")
+                st.write(" **Trigger Settings**")
+                drop_percent = st.number_input("Drop % to Buy", value=0.3, step=0.1)
                 
+                st.write(" **Risk Management ($)**")
                 c1, c2 = st.columns(2)
-                sl_percent = c1.number_input("Stop Loss %", value=10.0, step=0.5)
-                tp_percent = c2.number_input("Take Profit %", value=1.0, step=0.5)
+                sl_amount = c1.number_input("Max Loss ($)", value=5.0, step=1.0)
+                tp_amount = c2.number_input("Target Profit ($)", value=5.0, step=1.0)
                 
+                st.write(" **Capital Config**")
                 c3, c4 = st.columns(2)
-                max_invest = c3.number_input("Max Total Cap ($)", value=500, step=50)
-                invest_per_trade = c4.number_input("Amt Per Trade ($)", value=50, step=10)
+                max_invest = c3.number_input("Total Cap ($)", value=500, step=50)
+                invest_per_trade = c4.number_input("Amt/Trade ($)", value=50, step=10)
                 
                 leverage = st.number_input("Leverage", value=10, step=1)
                 
-                apply_btn = st.form_submit_button("Update Settings")
+                apply_btn = st.form_submit_button("Update Strategy")
             
-            # Save settings to session state dictionary
+            # Save settings
             settings = {
                 "drop_percent": drop_percent,
-                "sl_percent": sl_percent,
-                "tp_percent": tp_percent,
+                "sl_amount": sl_amount,
+                "tp_amount": tp_amount,
                 "max_invest": max_invest,
                 "invest_per_trade": invest_per_trade,
                 "leverage": leverage
@@ -286,7 +295,7 @@ def main():
     if st.session_state.reference_price:
         ref = st.session_state.reference_price
         target = ref * (1 - (settings['drop_percent']/100))
-        k2.metric(f"Ref / Buy < {settings['drop_percent']}%", f"${ref:.2f}", f"Target: ${target:.2f}")
+        k2.metric(f"Ref / Target (-{settings['drop_percent']}%)", f"${ref:.2f}", f"Buy: ${target:.2f}")
     else:
         k2.metric("Ref Price", "Waiting...")
 
@@ -305,8 +314,9 @@ def main():
         
         # Draw Lines if Active
         if st.session_state.reference_price:
+            # Reference
             fig.add_hline(y=st.session_state.reference_price, line_dash="dot", line_color="gray", annotation_text="Ref")
-            
+            # Buy Target
             target_p = st.session_state.reference_price * (1 - (settings['drop_percent']/100))
             fig.add_hline(y=target_p, line_dash="solid", line_color="green", annotation_text="BUY")
 
@@ -331,7 +341,7 @@ def main():
     if st.session_state.active:
         status_msg = run_strategy_logic(bot, settings)
         st.caption(f"🤖 Status: {status_msg} | Checked: {datetime.now().strftime('%H:%M:%S')}")
-        time.sleep(3) # Check every 3 seconds for faster updates
+        time.sleep(3) # Check every 3 seconds
         st.rerun()
 
 if __name__ == "__main__":
