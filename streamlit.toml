@@ -2,3 +2,6 @@
 api_key = "GRhKQxcqbO043xbZ"
 email = "c41yn13m@gmail.com"
 password = "Eodbs7218!"
+
+[gemini]
+api_key = "AIzaSyDn4XLeN8keRvkUF9reuNUdYYKt_n7RIy8"
