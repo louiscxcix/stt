@@ -49,10 +49,11 @@ class CapitalClient:
     def connect(self):
         try:
             r = self.session.get(f"{self.base_url}/api/v1/session/encryptionKey", headers={'X-CAP-API-KEY': self.cap_key})
-            if r.status_code == 401: return False
-            r.raise_for_status()
+            if r.status_code != 200:
+                st.sidebar.error(f"Key Error: {r.status_code}")
+                return False
+                
             data = r.json()
-            
             pw = self._encrypt_password(data['encryptionKey'], int(data['timeStamp']))
             
             payload = {"identifier": self.login, "password": pw, "encryptedPassword": True}
@@ -62,10 +63,14 @@ class CapitalClient:
                 self.cst = r.headers.get('CST')
                 self.x_security = r.headers.get('X-SECURITY-TOKEN')
                 return True
+            else:
+                st.sidebar.error(f"Session Error: {r.text}")
+                return False
+        except Exception as e:
+            st.sidebar.error(f"Conn Exception: {e}")
             return False
-        except: return False
 
-    # --- ROBUST DATA FETCHING (Separated calls) ---
+    # --- DEBUGGED DATA FETCHING ---
     def get_market_data(self, epic="ETHUSD"):
         headers = {'X-CAP-API-KEY': self.cap_key, 'CST': self.cst, 'X-SECURITY-TOKEN': self.x_security}
         
@@ -74,28 +79,36 @@ class CapitalClient:
         positions = []
         candles = []
 
-        # 1. Get Positions (CRITICAL)
+        # 1. POSITIONS (Check for failures)
         try:
             r = self.session.get(f"{self.base_url}/api/v1/positions", headers=headers)
             if r.status_code == 200:
                 positions = r.json().get('positions', [])
-        except: pass
+            elif r.status_code == 401:
+                self.connect() # Re-login if expired
+        except Exception as e:
+            st.sidebar.warning(f"Pos Fetch Fail: {e}")
 
-        # 2. Get Account
+        # 2. ACCOUNTS (Check for failures)
         try:
             r = self.session.get(f"{self.base_url}/api/v1/accounts", headers=headers)
             if r.status_code == 200:
-                account = r.json()['accounts'][0]['balance']
+                # Capital.com returns a list of accounts. We grab the first one.
+                acc_list = r.json().get('accounts', [])
+                if acc_list:
+                    account = acc_list[0].get('balance', {})
+            else:
+                st.sidebar.warning(f"Acc Fetch Fail: {r.status_code}")
         except: pass
 
-        # 3. Get Price
+        # 3. PRICE
         try:
             r = self.session.get(f"{self.base_url}/api/v1/markets/{epic}", headers=headers)
             if r.status_code == 200:
                 price = r.json()['snapshot']['offer']
         except: pass
 
-        # 4. Get History (For AI)
+        # 4. HISTORY
         try:
             r = self.session.get(f"{self.base_url}/api/v1/prices/{epic}?resolution=MINUTE&max=5", headers=headers)
             if r.status_code == 200: 
@@ -247,23 +260,58 @@ def main():
         log_ph = st.empty()
 
     while True:
-        # 1. Fetch Data (Resilient)
+        # 1. DATA REFRESH
         price, account, positions, candles = bot.get_market_data("ETHUSD")
         
+        # 2. METRICS EXTRACTION (Fail-safe defaults)
         equity = account.get('equity', 0)
         available = account.get('available', 0)
         margin = account.get('margin', 0)
         pl = account.get('profitLoss', 0)
         
-        # 2. Update UI (HEADER)
+        # 3. SAFETY CHECK (20% Reserve, but allow trading if above)
+        safe_to_trade = available > (equity * 0.20)
+        
+        now = datetime.now()
+        in_cooldown = st.session_state.cooldown_until and now < st.session_state.cooldown_until
+        time_since = (now - st.session_state.last_ai_check).total_seconds()
+        
+        if st.session_state.active and not in_cooldown:
+            if time_since > 10:
+                if safe_to_trade:
+                    # REMOVED MAX POSITION LIMIT - UNLIMITED TRADING
+                    decision, reason = ask_gemini_aggressive(bot, price, candles)
+                    
+                    if "429" in reason:
+                        st.session_state.cooldown_until = now + timedelta(seconds=60)
+                        st.toast("⚠️ Rate Limit - Cooling 60s")
+                    else:
+                        timestamp = now.strftime('%H:%M:%S')
+                        log_entry = f"[{timestamp}] {decision}: {reason}"
+                        st.session_state.ai_log.insert(0, log_entry)
+                        st.session_state.last_ai_check = now
+                        
+                        side = "BUY" if "BUY" in decision else "SELL"
+                        size = calculate_trade_size(decision, equity, price)
+                        
+                        if size > 0:
+                            success, msg = bot.place_order("ETHUSD", side, size)
+                            if success:
+                                st.toast(f"⚡ {decision} {size} ETH", icon="🔥")
+                            else:
+                                st.session_state.ai_log.insert(0, f"[{timestamp}] API REFUSED: {msg}")
+                else:
+                    st.error(f"LOW FUNDS: ${available} < Reserve")
+
+        # 4. UI UPDATE
         with header_ph.container():
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("Equity", f"€{equity:,.2f}")
-            c2.metric("Free Funds", f"€{available:,.2f}")
+            c2.metric("Free Funds", f"€{available:,.2f}", delta=f"Safe: €{equity*0.2:.0f}")
             c3.metric("Margin Used", f"€{margin:,.2f}")
             c4.metric("Total P/L", f"€{pl:,.2f}", delta=pl)
 
-        # 3. Update UI (POSITIONS TABLE) - Always show real data
+        # 5. TABLE UPDATE
         if positions:
             trade_list = []
             for p in positions:
@@ -278,43 +326,7 @@ def main():
                 })
             table_ph.dataframe(pd.DataFrame(trade_list), use_container_width=True)
         else:
-            table_ph.info("No Open Trades found on Account.")
-
-        # 4. AI Logic
-        safe_to_trade = available > 50
-        now = datetime.now()
-        in_cooldown = st.session_state.cooldown_until and now < st.session_state.cooldown_until
-        time_since = (now - st.session_state.last_ai_check).total_seconds()
-        
-        if st.session_state.active and not in_cooldown:
-            if time_since > 10:
-                if safe_to_trade:
-                    if len(positions) < 3: 
-                        decision, reason = ask_gemini_aggressive(bot, price, candles)
-                        
-                        if "429" in reason:
-                            st.session_state.cooldown_until = now + timedelta(seconds=60)
-                            st.toast("⚠️ Rate Limit - Cooling 60s")
-                        else:
-                            timestamp = now.strftime('%H:%M:%S')
-                            log_entry = f"[{timestamp}] {decision}: {reason}"
-                            st.session_state.ai_log.insert(0, log_entry)
-                            st.session_state.last_ai_check = now
-                            
-                            side = "BUY" if "BUY" in decision else "SELL"
-                            size = calculate_trade_size(decision, equity, price)
-                            
-                            if size > 0:
-                                success, msg = bot.place_order("ETHUSD", side, size)
-                                if success:
-                                    st.toast(f"⚡ {decision} {size} ETH", icon="🔥")
-                                else:
-                                    st.session_state.ai_log.insert(0, f"[{timestamp}] EXEC FAIL: {msg}")
-                    else:
-                        st.session_state.ai_log.insert(0, f"[{now.strftime('%H:%M:%S')}] Max Positions (3). Waiting.")
-                        st.session_state.last_ai_check = now
-                else:
-                    st.error(f"LOW FUNDS: ${available} < $50")
+            table_ph.info("Scanning for setup...")
 
         with log_ph.container(height=400):
             for log in st.session_state.ai_log[:20]:
