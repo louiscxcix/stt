@@ -7,9 +7,10 @@ from datetime import datetime
 import pytz
 
 # --- CONFIGURATION ---
-st.set_page_config(page_title="Pro AI Trader", layout="wide", page_icon="📈")
+st.set_page_config(page_title="Ultra-Aggressive Trader", layout="wide", page_icon="🚀")
 
-# ⚠️ CHANGE TO 'https://api-capital.backend-capital.com' FOR LIVE
+# ⚠️ LIVE TRADING URL (Switch carefully)
+# BASE_URL = "https://api-capital.backend-capital.com"
 BASE_URL = "https://demo-api-capital.backend-capital.com" 
 
 SESSION_URL = f"{BASE_URL}/api/v1/session"
@@ -17,25 +18,24 @@ ACCOUNTS_URL = f"{BASE_URL}/api/v1/accounts"
 POSITIONS_URL = f"{BASE_URL}/api/v1/positions"
 MARKETS_URL = f"{BASE_URL}/api/v1/markets"
 
-WATCHLIST = ["BTCUSD", "ETHUSD", "EURUSD", "GBPUSD", "GOLD", "OIL_CRUDE", "US500", "AAPL", "TSLA"]
+# Scans ALL of these every cycle
+WATCHLIST = ["BTCUSD", "ETHUSD", "EURUSD", "GBPUSD", "GOLD", "US500", "TSLA"]
 
-# --- SECRETS SETUP ---
 try:
     CAP_API_KEY = st.secrets["capital_com"]["api_key"]
     CAP_EMAIL = st.secrets["capital_com"]["email"]
     CAP_PASSWORD = st.secrets["capital_com"]["password"]
     GEMINI_KEY = st.secrets["gemini"]["GEMINI_API_KEY"]
 except:
-    st.error("❌ Secrets file missing. Please set up .streamlit/secrets.toml")
+    st.error("❌ Secrets missing.")
     st.stop()
 
 genai.configure(api_key=GEMINI_KEY)
 model = genai.GenerativeModel('gemini-pro')
 
-# --- ROBUST FUNCTIONS ---
+# --- NETWORK FUNCTIONS ---
 
 def get_session():
-    """Authenticates and returns headers. Returns None if fails."""
     headers = {"X-CAP-API-KEY": CAP_API_KEY, "Content-Type": "application/json"}
     data = {"identifier": CAP_EMAIL, "password": CAP_PASSWORD}
     try:
@@ -47,53 +47,52 @@ def get_session():
                 "X-CAP-API-KEY": CAP_API_KEY,
                 "Content-Type": "application/json"
             }
-    except Exception as e:
-        print(f"Connection Error: {e}")
+    except: pass
     return None
 
 def get_account(headers):
-    """Fetches account data safely."""
     try:
         resp = requests.get(ACCOUNTS_URL, headers=headers)
         if resp.status_code == 200:
-            data = resp.json()
-            if 'accounts' in data and len(data['accounts']) > 0:
-                return data['accounts'][0]['balance']
+            return resp.json()['accounts'][0]['balance']
         elif resp.status_code == 401:
             return "UNAUTHORIZED"
-    except Exception as e:
-        print(f"Account Fetch Error: {e}")
+    except: pass
     return None
 
 def get_positions(headers):
-    """Fetches full position details."""
     try:
         resp = requests.get(POSITIONS_URL, headers=headers)
         if resp.status_code == 200:
             return resp.json().get('positions', [])
-    except:
-        pass
+    except: pass
     return []
 
 def close_all_positions(headers, positions):
-    st.warning("⏰ MIDNIGHT: Closing ALL positions.")
+    st.toast("🔥 Closing ALL Trades (Midnight Protocol)")
     for p in positions:
         requests.delete(f"{POSITIONS_URL}/{p['dealId']}", headers=headers)
-        time.sleep(0.2)
 
 def execute_trade(headers, epic, direction, size):
     payload = {
         "epic": epic, "direction": direction, "size": size,
         "guaranteedStop": False, "trailingStop": False
     }
+    # Fire and forget (don't wait for detailed response to speed up)
     requests.post(POSITIONS_URL, json=payload, headers=headers)
 
-def ai_decision(epic, price, change, equity, available):
+def ai_aggressive_decision(epic, price, change):
+    # FORCE AI TO CHOOSE - Penalize 'WAIT'
     prompt = f"""
-    Act as a high-frequency trading bot.
-    Context: {epic} | Price: {price} | Change: {change}% | Equity: {equity} | Funds: {available}
-    Task: AGGRESSIVE profit maximization.
-    Output JSON ONLY: {{"action": "BUY"/"SELL"/"WAIT", "confidence": 0-100}}
+    You are a high-frequency scalper.
+    Asset: {epic} | Price: {price} | Change: {change}%
+    
+    INSTRUCTIONS:
+    1. You MUST pick BUY or SELL unless the market is dead flat.
+    2. Be aggressive. Volatility is opportunity.
+    3. Ignore safety. Focus on short-term direction.
+    
+    Output JSON ONLY: {{"action": "BUY" or "SELL", "confidence": 60-100}}
     """
     try:
         resp = model.generate_content(prompt)
@@ -101,144 +100,109 @@ def ai_decision(epic, price, change, equity, available):
         import json
         return json.loads(text)
     except:
-        return {"action": "WAIT", "confidence": 0}
+        # Default to a random aggressive move if AI fails (Fallback)
+        return {"action": "BUY", "confidence": 50} 
 
-# --- MAIN APP ---
+# --- UI & LOGIC ---
 
-st.title("💸 AI Wealth Manager")
+st.title("🚀 Ultra-Aggressive Bot")
 
-# UI Layout: Sidebar for controls
+# Sidebar
 with st.sidebar:
-    st.header("⚙️ Bot Control")
-    run_bot = st.toggle("ACTIVATE TRADING", value=False)
-    st.markdown("---")
-    st.markdown("**Strategy:** Aggressive Micro-Trading")
-    st.markdown("**Max Allocation:** 80%")
-    st.markdown("**Midnight Close:** ON")
+    is_running = st.toggle("ACTIVATE KILL SWITCH", value=False, key="run_state")
+    st.write("Status:", "🟢 ACTIVE" if is_running else "🔴 STOPPED")
+    if st.button("Reconnect"):
+        st.session_state["headers"] = get_session()
 
-# Layout Placeholders
-metrics_container = st.container()
-st.markdown("---")
-positions_container = st.container()
-st.markdown("---")
-log_container = st.container()
+# Containers
+metrics_area = st.container()
+st.divider()
+log_area = st.container()
+st.divider()
+trades_area = st.container()
 
-# Session State Init
+# State
 if "headers" not in st.session_state:
     st.session_state["headers"] = get_session()
 
-# --- BOT LOOP ---
-if run_bot:
-    while True:
-        # 1. Connection Check
-        if not st.session_state["headers"]:
-            st.session_state["headers"] = get_session()
-            if not st.session_state["headers"]:
-                st.error("Waiting for connection...")
-                time.sleep(5)
-                continue
+# --- MAIN LOOP ---
+headers = st.session_state["headers"]
 
-        # 2. Fetch Data
-        headers = st.session_state["headers"]
-        acct = get_account(headers)
-        
-        # 3. Handle Auth
-        if acct == "UNAUTHORIZED":
-            st.session_state["headers"] = get_session()
-            continue
-        elif acct is None:
-            time.sleep(2)
-            continue 
+if not headers:
+    headers = get_session()
+    st.session_state["headers"] = headers
 
-        # 4. Extract Metrics
-        equity = acct.get('equity', 0.0)      # Total Asset Value
-        available = acct.get('available', 0.0) # Free to trade
-        pnl = acct.get('profitLoss', 0.0)      # Total P&L
-        balance = acct.get('balance', 0.0)     # Cash Balance
+if headers:
+    acct = get_account(headers)
+    
+    if acct == "UNAUTHORIZED":
+        st.session_state["headers"] = get_session()
+        st.rerun()
         
+    if acct:
+        # 1. Update Metrics
+        equity = acct.get('equity', 0.0)
+        available = acct.get('available', 0.0)
         positions = get_positions(headers)
         
-        # 5. RENDER DASHBOARD (Account Metrics)
-        with metrics_container:
-            # Clear previous content slightly by overwriting
-            metrics_container.subheader("🏦 Account Overview")
-            m1, m2, m3, m4 = st.columns(4)
-            
-            # Styling metrics
-            m1.metric("Total Equity (Assets)", f"${equity:,.2f}", help="Cash + Open P&L")
-            m2.metric("Available Funds", f"${available:,.2f}", help="Funds available for new trades")
-            m3.metric("Total P&L", f"${pnl:,.2f}", delta=f"{pnl:,.2f}")
-            m4.metric("Active Trades", len(positions))
+        with metrics_area:
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Equity", f"${equity:,.0f}")
+            c2.metric("Available", f"${available:,.0f}")
+            c3.metric("P&L", f"${acct.get('profitLoss', 0):,.2f}")
+            c4.metric("Open Trades", len(positions))
 
-        # 6. RENDER OPEN TRADES (Detailed)
-        with positions_container:
-            positions_container.subheader("📊 Open Positions Breakdown")
+        with trades_area:
             if positions:
-                # Prepare data for cleaner display
-                pos_data = []
-                for p in positions:
-                    pos_data.append({
-                        "Instrument": p['epic'],
-                        "Action": p['direction'],
-                        "Size": p['dealSize'],
-                        "Open Price": f"${p['openPrice']}",
-                        "Current P&L": p['profitAndLoss'],
-                        "Date": p['createdDate']
-                    })
-                
-                df = pd.DataFrame(pos_data)
-                
-                # Use column configuration for better P&L coloring
-                st.dataframe(
-                    df,
-                    column_config={
-                        "Current P&L": st.column_config.NumberColumn(
-                            "Profit / Loss ($)",
-                            format="$%.2f",
-                        )
-                    },
-                    use_container_width=True,
-                    hide_index=True
-                )
+                df = pd.DataFrame(positions)
+                st.dataframe(df[['epic', 'direction', 'profitAndLoss', 'dealSize']], use_container_width=True)
             else:
-                st.info("No trades currently open. AI is scanning...")
+                st.info("No positions. Hunting...")
 
-        # 7. Midnight Protocol
-        now = datetime.now(pytz.utc)
-        if now.hour == 23 and now.minute >= 59:
-            if positions: close_all_positions(headers, positions)
-            time.sleep(60)
-            continue
-
-        # 8. AI Scanning & Execution
-        usage = (equity - available) / equity if equity > 0 else 0
-        
-        if usage < 0.80:
-            import random
-            target = random.choice(WATCHLIST)
+        # 2. AGGRESSIVE LOGIC
+        if is_running:
+            now = datetime.now(pytz.utc)
             
-            try:
-                mkt = requests.get(f"{MARKETS_URL}/{target}", headers=headers).json()
-                if 'snapshot' in mkt:
-                    price = mkt['snapshot']['offer']
-                    change = mkt['snapshot']['dailyChange']
+            # Midnight Close
+            if now.hour == 23 and now.minute >= 59:
+                if positions: close_all_positions(headers, positions)
+            
+            else:
+                # LOOP ALL ASSETS (No random choice anymore)
+                for asset in WATCHLIST:
                     
-                    dec = ai_decision(target, price, change, equity, available)
-                    
-                    with log_container:
-                        # Keep only the latest log
-                        log_container.text(f"🤖 Scanning {target}... Action: {dec.get('action')} | Conf: {dec.get('confidence')}%")
-                    
-                    if dec.get('action') in ["BUY", "SELL"] and dec.get('confidence', 0) > 75:
-                        size = 0.01 if "BTC" in target else 1
-                        execute_trade(headers, target, dec['action'], size)
-                        st.toast(f"⚡ Executed {dec['action']} on {target}")
-                        time.sleep(2)
-            except Exception as e:
-                pass
+                    # Check funds (Stop if > 80% used)
+                    if (equity - available) / equity > 0.80:
+                        st.warning("Max Margin Reached. Pausing entries.")
+                        break
 
-        time.sleep(3)
-        st.rerun()
-
-elif not run_bot:
-    st.info("Bot is paused. Toggle 'Activate Trading' in the sidebar to start.")
+                    try:
+                        # Get Price
+                        mkt = requests.get(f"{MARKETS_URL}/{asset}", headers=headers).json()
+                        if 'snapshot' in mkt:
+                            price = mkt['snapshot']['offer']
+                            change = mkt['snapshot']['dailyChange']
+                            
+                            # AI Decision
+                            dec = ai_aggressive_decision(asset, price, change)
+                            action = dec.get('action')
+                            conf = dec.get('confidence', 0)
+                            
+                            # LOG IT
+                            with log_area:
+                                st.write(f"⚔️ **{asset}**: AI says **{action}** ({conf}%)")
+                            
+                            # EXECUTE (Threshold lowered to 60%)
+                            if action in ["BUY", "SELL"] and conf >= 60:
+                                # AGGRESSIVE SIZING
+                                size = 0.02 if "BTC" in asset else 1  # Doubled size
+                                execute_trade(headers, asset, action, size)
+                                st.toast(f"💣 OPENED {action} on {asset}!")
+                                time.sleep(0.5) # Slight delay to avoid API ban
+                                
+                    except Exception as e:
+                        print(e)
+            
+            # Fast cycle
+            time.sleep(1)
+            st.rerun()
