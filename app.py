@@ -5,7 +5,7 @@ import google.generativeai as genai
 import time
 from datetime import datetime
 import json
-import re
+import random
 
 # --- CONFIGURATION ---
 st.set_page_config(page_title="Portfolio AI Manager", layout="wide", page_icon="🏢")
@@ -17,11 +17,11 @@ ACCOUNTS_URL = f"{BASE_URL}/api/v1/accounts"
 POSITIONS_URL = f"{BASE_URL}/api/v1/positions"
 MARKETS_URL = f"{BASE_URL}/api/v1/markets"
 
-# MASSIVE PORTFOLIO (Analyzed in batches)
+# MASSIVE PORTFOLIO
 PORTFOLIO = [
     "BTCUSD", "ETHUSD", "XRPUSD", "LTCUSD",      # Crypto
     "EURUSD", "GBPUSD", "USDJPY", "AUDUSD",      # Forex
-    "GOLD", "SILVER", "OIL_CRUDE", "NATURAL_GAS",# Commodities
+    "GOLD", "SILVER", "OIL_CRUDE",               # Commodities
     "US500", "US30", "DE40", "JP225",            # Indices
     "TSLA", "NVDA", "AAPL", "MSFT", "AMZN"       # Stocks
 ]
@@ -37,12 +37,13 @@ except:
     st.stop()
 
 genai.configure(api_key=GEMINI_KEY)
-# Flash Lite is perfect for large context windows (batching)
+# Using Flash Lite for large context windows
 model = genai.GenerativeModel('gemini-2.5-flash-lite')
 
 # --- STATE ---
 if "log_history" not in st.session_state: st.session_state["log_history"] = []
 if "headers" not in st.session_state: st.session_state["headers"] = None
+if "last_raw_response" not in st.session_state: st.session_state["last_raw_response"] = "Waiting for first scan..."
 
 # --- FUNCTIONS ---
 
@@ -81,13 +82,10 @@ def execute_trade(headers, epic, direction, size):
     requests.post(POSITIONS_URL, json=payload, headers=headers)
 
 def fetch_market_batch(headers, assets):
-    """
-    Fetches price data for MULTIPLE assets at once to save time.
-    """
+    """Fetches price data for MULTIPLE assets at once."""
     batch_data = []
     for asset in assets:
         try:
-            # Capital.com is fast, we can loop this quickly without hitting Gemini limits
             resp = requests.get(f"{MARKETS_URL}/{asset}", headers=headers)
             if resp.status_code == 200:
                 data = resp.json()
@@ -96,9 +94,7 @@ def fetch_market_batch(headers, assets):
                     batch_data.append({
                         "symbol": asset,
                         "price": s.get('offer', 0),
-                        "change": s.get('dailyChange', 0),
-                        "high": s.get('high', 0),
-                        "low": s.get('low', 0)
+                        "change": s.get('dailyChange', 0)
                     })
         except: pass
     return batch_data
@@ -106,55 +102,54 @@ def fetch_market_batch(headers, assets):
 def analyze_portfolio_batch(market_data_list):
     """
     SENDS ONE MASSIVE PROMPT TO GEMINI.
-    "Here is the data for 10 assets. Pick the top 3."
     """
-    
-    # Convert list of dicts to a string table for the AI
     data_str = json.dumps(market_data_list, indent=2)
     
     prompt = f"""
-    You are a Senior Portfolio Manager.
-    Here is the live market data for our watchlist:
-    
+    You are a Hedge Fund Manager.
+    Here is live market data:
     {data_str}
     
     TASK:
-    1. Scan all assets.
-    2. Identify ONLY the "Lucrative" opportunities (Strong Buy or Strong Sell).
-    3. Ignore anything with weak momentum or low volatility.
-    4. Select a maximum of 3 trades.
+    1. Scan for High Volatility opportunities.
+    2. Select the Top 3 trades (if any).
+    3. Be Aggressive.
     
     RESPONSE FORMAT (JSON LIST):
     [
-        {{
-            "asset": "BTCUSD",
-            "action": "BUY",
-            "confidence": 85,
-            "reason": "Breakout above resistance with 2% volume spike"
-        }},
+        {{"asset": "BTCUSD", "action": "BUY", "confidence": 85, "reason": "Momentum breakout"}},
         ...
     ]
-    If no good trades, return an empty list [].
+    If market is boring, return [] (empty list).
     """
     
     try:
         response = model.generate_content(prompt)
         text = response.text.replace("```json", "").replace("```", "").strip()
+        st.session_state["last_raw_response"] = text # Save for debug
         return json.loads(text)
     except Exception as e:
+        st.session_state["last_raw_response"] = f"Error: {e}"
         return []
 
 # --- UI LAYOUT ---
 
 st.title(f"🏢 Portfolio AI Manager")
 
+# Sidebar
 with st.sidebar:
     st.header("Control")
     run_bot = st.toggle("ACTIVATE FUND MANAGER", key="run_bot")
     if st.button("Reconnect"):
         st.session_state["headers"] = get_session()
         st.rerun()
+        
+    st.divider()
+    with st.expander("🛠️ Debug: Raw AI Output"):
+        st.caption("See exactly what Gemini replied in the last cycle:")
+        st.code(st.session_state["last_raw_response"], language="json")
 
+# Connect
 headers = st.session_state["headers"]
 if not headers:
     headers = get_session()
@@ -180,7 +175,7 @@ if headers:
         
         st.divider()
 
-        # 2. POSITIONS (Top Priority)
+        # 2. POSITIONS (TOP PRIORITY)
         st.subheader("⚔️ Active Positions")
         if positions:
             df = pd.DataFrame(positions)
@@ -190,55 +185,57 @@ if headers:
                 column_config={"profitAndLoss": st.column_config.NumberColumn("P&L", format="$%.2f")}
             )
         else:
-            st.info("No trades open. Portfolio scanner active.")
+            st.info("No trades currently open.")
 
         st.divider()
 
-        # 3. LIVE DECISION LOG (Table View)
-        st.subheader("📜 Portfolio Decisions")
-        if st.session_state["log_history"]:
-            log_df = pd.DataFrame(st.session_state["log_history"])
-            
-            # Use Streamlit's new column config for progress bars
-            st.dataframe(
-                log_df, 
-                use_container_width=True, 
-                hide_index=True,
-                column_config={
-                    "Conf": st.column_config.ProgressColumn(
-                        "AI Confidence",
-                        format="%d%%",
-                        min_value=0,
-                        max_value=100
-                    ),
-                    "Action": st.column_config.TextColumn("Action"),
-                    "Asset": st.column_config.TextColumn("Asset"),
-                }
-            )
-        else:
-            st.caption("Waiting for first batch analysis...")
+        # 3. LIVE ACTIVITY LOG (Folded)
+        with st.expander("📜 Live System Log (Click to View)", expanded=True):
+            if st.session_state["log_history"]:
+                log_df = pd.DataFrame(st.session_state["log_history"])
+                st.dataframe(
+                    log_df, 
+                    use_container_width=True, 
+                    hide_index=True,
+                    column_config={
+                        "Action": st.column_config.TextColumn("Action"),
+                        "Details": st.column_config.TextColumn("Details", width="large"),
+                    }
+                )
+            else:
+                st.caption("Log is empty. Waiting for start...")
 
         # --- EXECUTION LOOP ---
         if run_bot:
             status_box = st.empty()
             
-            # BATCH LOGIC: Scan 8 assets at a time (Safe for 1 prompt)
-            import random
-            batch = random.sample(PORTFOLIO, 8) 
+            # Select 8 random assets for this batch
+            batch = random.sample(PORTFOLIO, 8)
+            batch_names = ", ".join(batch[:3]) + "..."
             
-            with status_box.status(f"⚡ Analyzing Portfolio Batch ({len(batch)} assets)...", expanded=True) as status:
+            with status_box.status(f"⚡ Scanning Batch: {batch_names}", expanded=True) as status:
                 
-                # 1. Fetch ALL Data (Fast)
-                status.write("Fetching market data...")
+                # A. Fetch Data
+                status.write("Fetching market prices...")
                 market_data = fetch_market_batch(headers, batch)
                 
                 if market_data:
-                    status.write(f"Data received for {len(market_data)} assets. Sending to AI...")
+                    status.write(f"Analyzing {len(market_data)} assets with Gemini 2.5...")
                     
-                    # 2. Send ONE Prompt to AI
+                    # B. AI Analysis
                     decisions = analyze_portfolio_batch(market_data)
                     
-                    if decisions:
+                    timestamp = datetime.now().strftime("%H:%M:%S")
+                    
+                    # C. Log Results (Even if Empty)
+                    if not decisions:
+                        status.write("AI found no lucrative trades.")
+                        st.session_state["log_history"].insert(0, {
+                            "Time": timestamp,
+                            "Action": "SCAN",
+                            "Details": f"Scanned {len(batch)} assets. No opportunities found."
+                        })
+                    else:
                         status.write(f"AI found {len(decisions)} opportunities!")
                         
                         for dec in decisions:
@@ -247,33 +244,30 @@ if headers:
                             conf = dec.get('confidence', 0)
                             reason = dec.get('reason', '-')
                             
-                            # Add to Log
-                            new_log = {
-                                "Time": datetime.now().strftime("%H:%M:%S"),
-                                "Asset": asset,
-                                "Action": action,
-                                "Conf": conf, # Int for progress bar
-                                "Reason": reason
-                            }
-                            st.session_state["log_history"].insert(0, new_log)
-                            if len(st.session_state["log_history"]) > 20: st.session_state["log_history"].pop()
+                            # Log Trade
+                            st.session_state["log_history"].insert(0, {
+                                "Time": timestamp,
+                                "Action": f"{action} ({conf}%)",
+                                "Details": f"{asset}: {reason}"
+                            })
                             
-                            # 3. Execute Lucrative Only
+                            # Execute
                             if action in ["BUY", "SELL"] and conf > 70:
                                 if avail > 100:
-                                    size = 0.01 if "BTC" in asset or "ETH" in asset else 1
+                                    size = 0.01 if "BTC" in asset else 1
                                     execute_trade(headers, asset, action, size)
                                     st.toast(f"✅ Executed: {action} {asset}")
                                     time.sleep(0.5)
                             else:
-                                status.write(f"Skipping {asset}: {action} (Conf {conf}%) - Not lucrative enough.")
-                    else:
-                        status.write("AI decided NO TRADES for this batch.")
-                
-            # COOLDOWN (60s cycle)
-            # Since we did 1 big call, we just wait 60s.
+                                status.write(f"Skipped {asset} (Conf {conf}% is too low)")
+
+                    # Trim Log
+                    if len(st.session_state["log_history"]) > 20: 
+                        st.session_state["log_history"] = st.session_state["log_history"][:20]
+
+            # D. Cooldown (60s)
             for s in range(60, 0, -1):
-                status_box.info(f"⏳ Next Portfolio Scan in {s}s")
+                status_box.info(f"⏳ Next Scan in {s}s")
                 time.sleep(1)
             
             st.rerun()
