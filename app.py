@@ -1,374 +1,214 @@
-# app.py
-"""
-MicroTrader — updated:
-- Top dashboard shows Total Assets, Equity, Available, P&L from Capital.com (best-effort)
-- Diversified instrument set
-- Simulation mode for safe testing
-- Live mode scaffolding (adapt endpoints/payloads to your account)
-"""
-
 import streamlit as st
 import requests
-import time
-import threading
 import pandas as pd
-import numpy as np
-import os
-from dotenv import load_dotenv
+import google.generativeai as genai
+import time
+import json
 
-load_dotenv()
-st.set_page_config(layout="wide", page_title="MicroTrader — Diversified")
+# --- CONFIGURATION & SETUP ---
+st.set_page_config(page_title="Aggressive Auto-Trader", layout="wide")
 
-# ---------- Config ----------
-MODE = st.sidebar.selectbox("Mode", ["SIMULATION", "LIVE"])
-USE_SIMULATION = (MODE == "SIMULATION")
-MAX_RISK_FRACTION = st.sidebar.slider("Max capital usage fraction per trade", 0.05, 0.95, 0.8, 0.05)
-TOTAL_POSITION_CAP = st.sidebar.slider("Max total exposure fraction", 0.1, 1.0, 0.9, 0.05)
-TICK_INTERVAL = st.sidebar.number_input("Poll interval (s)", 0.5, 60.0, 2.0, 0.5)
-
-# diversified instruments (epics / symbols). Adjust to Capital.com epics you want to trade.
-INSTRUMENTS = st.sidebar.multiselect(
-    "Instruments (examples)", 
-    ["BTCUSD", "ETHUSD", "XAUUSD", "EURUSD", "US100", "DE30", "AAPL", "TSLA", "GBPUSD"],
-    default=["BTCUSD", "ETHUSD", "EURUSD", "US100"]
-)
-
-def get_secret(section, key, fallback=None):
-    try:
-        return st.secrets[section][key]
-    except Exception:
-        return os.getenv(f"{section.upper()}_{key.upper()}", fallback)
-
-CAP_API_KEY = get_secret("capital_com", "api_key")
-CAP_EMAIL = get_secret("capital_com", "email")
-CAP_PASSWORD = get_secret("capital_com", "password")
-
-if MODE == "LIVE" and not (CAP_API_KEY and CAP_EMAIL and CAP_PASSWORD):
-    st.error("LIVE mode requires Capital.com credentials in st.secrets or environment variables.")
+# 1. API CONFIGURATION (Load from st.secrets)
+try:
+    CAPITAL_API_KEY = st.secrets["capital_com"]["api_key"]
+    CAPITAL_EMAIL = st.secrets["capital_com"]["email"]
+    CAPITAL_PASSWORD = st.secrets["capital_com"]["password"]
+    GEMINI_API_KEY = st.secrets["gemini"]["GEMINI_API_KEY"]
+except FileNotFoundError:
+    st.error("Secrets file not found. Please set up .streamlit/secrets.toml")
     st.stop()
 
-# ---------- Capital.com helper (scaffold) ----------
-class CapitalClient:
-    BASE = "https://api-capital.backend-capital.com"  # adjust region if required
-    def __init__(self, api_key, email=None, password=None):
-        self.api_key = api_key
-        self.email = email
-        self.password = password
-        self.headers = {"X-CAP-API-KEY": self.api_key, "Content-Type": "application/json"}
-        self.cst = None
-        self.xsec = None
+# Configure Gemini
+genai.configure(api_key=GEMINI_API_KEY)
+model = genai.GenerativeModel('gemini-pro')
 
-    def start_session(self):
-        """
-        Proper flow per Capital.com docs:
-         - GET /session/encryptionKey (optional) -> encrypt password (if required)
-         - POST /session -> obtain CST & X-SECURITY-TOKEN headers
-        """
-        try:
-            r = requests.post(self.BASE + "/session",
-                              json={"identifier": self.email, "password": self.password, "encryptedPassword": False},
-                              headers=self.headers, timeout=10)
-            if r.status_code in (200,201):
-                self.cst = r.headers.get("CST")
-                self.xsec = r.headers.get("X-SECURITY-TOKEN")
-                if self.cst and self.xsec:
-                    self.headers["CST"] = self.cst
-                    self.headers["X-SECURITY-TOKEN"] = self.xsec
-                    return True, r.json()
-                return False, {"error":"session ok but tokens missing"}
-            return False, {"status": r.status_code, "text": r.text}
-        except Exception as e:
-            return False, {"error": str(e)}
+# Capital.com API Endpoints (Using DEMO for safety - Change to 'api-capital' for live)
+# BASE_URL = "https://api-capital.backend-capital.com" # LIVE
+BASE_URL = "https://demo-api-capital.backend-capital.com" # DEMO
+SESSION_URL = f"{BASE_URL}/api/v1/session"
+ACCOUNTS_URL = f"{BASE_URL}/api/v1/accounts"
+POSITIONS_URL = f"{BASE_URL}/api/v1/positions"
+MARKET_URL = f"{BASE_URL}/api/v1/markets"
 
-    def get_account_summary(self):
-        """
-        Best-effort multi-endpoint approach:
-         - GET /accounts or /tradingAccounts or /clients
-        We'll try several shapes and return the best parsed result:
-         {total_assets, equity, available, pnl}
-        """
-        endpoints = ["/accounts", "/tradingAccounts", "/clients", "/accounts/overview"]
-        for ep in endpoints:
-            try:
-                r = requests.get(self.BASE + ep, headers=self.headers, timeout=8)
-                if r.status_code == 200:
-                    data = r.json()
-                    # Attempt to parse common fields; adapt per your account response
-                    # 1) If data is dict with 'equity' & 'available'
-                    if isinstance(data, dict):
-                        equity = data.get("equity") or data.get("balance") or data.get("availableBalance")
-                        available = data.get("available") or data.get("freeMargin") or data.get("availableBalance")
-                        pnl = data.get("pl") or data.get("unrealisedPnl") or 0.0
-                        # total assets fallback
-                        total = data.get("totalAssets") or equity or (available + pnl)
-                        return True, {"total_assets": total or 0.0, "equity": equity or 0.0, "available": available or 0.0, "pnl": pnl or 0.0}
-                    # 2) If data is list, try first account
-                    if isinstance(data, list) and data:
-                        acct = data[0]
-                        equity = acct.get("equity") or acct.get("balance") or 0.0
-                        available = acct.get("available") or acct.get("freeMargin") or 0.0
-                        pnl = acct.get("pl") or 0.0
-                        total = acct.get("totalAssets") or equity
-                        return True, {"total_assets": total, "equity": equity, "available": available, "pnl": pnl}
-            except Exception:
-                continue
-        return False, {"error":"no accounts endpoint matched"}
+# --- HELPER FUNCTIONS ---
 
-    def get_price(self, epic):
-        # Common REST price polling endpoint
-        try:
-            r = requests.get(self.BASE + f"/prices/{epic}", headers=self.headers, timeout=5)
-            if r.status_code == 200:
-                return True, r.json()
-        except Exception:
-            pass
-        return False, {}
+def get_capital_session():
+    """Authenticates and returns session headers (CST, X-SECURITY-TOKEN)."""
+    headers = {
+        "X-CAP-API-KEY": CAPITAL_API_KEY,
+        "Content-Type": "application/json"
+    }
+    data = {
+        "identifier": CAPITAL_EMAIL,
+        "password": CAPITAL_PASSWORD
+    }
+    
+    try:
+        response = requests.post(SESSION_URL, json=data, headers=headers)
+        if response.status_code == 200:
+            cst = response.headers.get("CST")
+            x_sec = response.headers.get("X-SECURITY-TOKEN")
+            return {"CST": cst, "X-SECURITY-TOKEN": x_sec}
+        else:
+            st.error(f"Login Failed: {response.text}")
+            return None
+    except Exception as e:
+        st.error(f"Connection Error: {e}")
+        return None
 
-    def place_market_order(self, epic, direction, notional):
-        # Live order scaffolding: replace with exact payload per docs
-        payload = {"epic": epic, "direction": "BUY" if direction == "long" else "SELL", "size": notional, "orderType":"MARKET"}
-        try:
-            r = requests.post(self.BASE + "/orders", json=payload, headers=self.headers, timeout=8)
-            return r.status_code, r.text
-        except Exception as e:
-            return 500, str(e)
+def get_account_data(auth_headers):
+    """Fetches equity, margin, and available funds."""
+    response = requests.get(ACCOUNTS_URL, headers=auth_headers)
+    if response.status_code == 200:
+        return response.json()
+    return None
 
-    def get_open_positions(self):
-        # Try common open positions endpoints
-        for ep in ["/positions", "/openPositions", "/tradingPositions"]:
-            try:
-                r = requests.get(self.BASE + ep, headers=self.headers, timeout=8)
-                if r.status_code == 200:
-                    return True, r.json()
-            except Exception:
-                continue
-        return False, {}
+def get_open_positions(auth_headers):
+    """Fetches current open trades."""
+    response = requests.get(POSITIONS_URL, headers=auth_headers)
+    if response.status_code == 200:
+        return response.json()['positions']
+    return []
 
-# ---------- Simulation core ----------
-class Simulator:
-    def __init__(self, starting_equity=20000.0):
-        self.starting_equity = starting_equity
-        self.equity = starting_equity
-        self.available = starting_equity
-        self.positions = {}
-        self.price_map = {sym: 100.0 + idx*50 for idx, sym in enumerate(INSTRUMENTS)}
-        self.seq = 0
-        np.random.seed(1)
+def get_market_price(auth_headers, epic="BTCUSD"):
+    """Fetches current price for a target asset (e.g., Bitcoin)."""
+    # Note: Using a specific epic for micro-trading example
+    url = f"{MARKET_URL}/{epic}"
+    response = requests.get(url, headers=auth_headers)
+    if response.status_code == 200:
+        return response.json()
+    return None
 
-    def step_prices(self):
-        for sym in self.price_map:
-            move = np.random.normal(0, self.price_map[sym]*0.001)
-            self.price_map[sym] = max(0.0001, self.price_map[sym] + move)
-        return self.price_map
+def ai_strategy_decision(market_data, account_data, positions):
+    """
+    Aggressive Strategy: Uses Gemini to decide BUY/SELL/HOLD based on data.
+    """
+    
+    # Construct a prompt for Gemini
+    current_equity = account_data['accounts'][0]['balance']['equity']
+    available_funds = account_data['accounts'][0]['balance']['available']
+    
+    prompt = f"""
+    You are a high-frequency, aggressive trading bot. 
+    Goal: Maximize profit using up to 80% of available funds.
+    
+    Context:
+    - Asset: {market_data.get('instrument', {}).get('name', 'Unknown')}
+    - Current Bid: {market_data.get('snapshot', {}).get('bid')}
+    - Current Ask: {market_data.get('snapshot', {}).get('offer')}
+    - Price Change %: {market_data.get('snapshot', {}).get('dailyChange')}
+    - Total Equity: {current_equity}
+    - Available Funds: {available_funds}
+    - Current Open Positions Count: {len(positions)}
+    
+    Task:
+    Analyze the data. If the price direction looks strong, recommend an aggressive entry.
+    If we are losing money on open positions, recommend a quick close.
+    
+    Response Format (JSON only):
+    {{
+        "decision": "BUY" or "SELL" or "HOLD" or "CLOSE_ALL",
+        "reasoning": "Short explanation (max 1 sentence)",
+        "confidence": "0-100"
+    }}
+    """
+    
+    try:
+        response = model.generate_content(prompt)
+        # Clean up code blocks if Gemini adds them
+        text = response.text.replace('```json', '').replace('```', '')
+        return json.loads(text)
+    except Exception as e:
+        return {"decision": "HOLD", "reasoning": f"AI Error: {e}", "confidence": 0}
 
-    def open(self, sym, direction, fraction):
-        notional = self.available * fraction
-        price = self.price_map[sym]
-        units = notional / price
-        self.seq += 1
-        tid = f"sim-{self.seq}"
-        self.positions[tid] = {"sym": sym, "direction": direction, "units": units, "open_price": price, "notional": notional, "pnl": 0.0}
-        self.available -= notional
-        return tid
+# --- MAIN UI LAYOUT ---
 
-    def update(self):
-        total_pnl = 0
-        for p in self.positions.values():
-            price = self.price_map[p["sym"]]
-            if p["direction"] == "long":
-                p["pnl"] = (price - p["open_price"]) * p["units"]
-            else:
-                p["pnl"] = (p["open_price"] - price) * p["units"]
-            total_pnl += p["pnl"]
-        self.equity = self.available + sum(p["notional"] for p in self.positions.values()) + total_pnl
-        return self.equity, self.available, total_pnl
+st.title("🤖 AI Algo-Trader (Capital.com)")
 
-    def close(self, tid):
-        pos = self.positions.pop(tid, None)
-        if not pos:
-            return 0.0
-        realized = pos["notional"] + pos["pnl"]
-        self.available += realized
-        self.update()
-        return realized
+# Sidebar for controls
+with st.sidebar:
+    st.header("Settings")
+    target_asset = st.text_input("Target Asset (Epic)", "BTCUSD")
+    trade_mode = st.radio("Trading Mode", ["Paper (Simulation)", "Live (DANGEROUS)"])
+    if trade_mode == "Live (DANGEROUS)":
+        st.warning("You are in LIVE mode. Real money will be used.")
+    
+    if st.button("Connect & Refresh"):
+        st.session_state['refresh'] = True
 
-# ---------- MicroTrader with diversification ----------
-class MicroTrader:
-    def __init__(self, client=None, sim=None, max_fraction=0.8, cap=0.9):
-        self.client = client
-        self.sim = sim
-        self.max_fraction = max_fraction
-        self.cap = cap
-        self.open_trades = {}  # tid -> info
-        self.log = []
+# Main Logic
+if 'auth_headers' not in st.session_state:
+    with st.spinner("Authenticating with Capital.com..."):
+        headers = get_capital_session()
+        if headers:
+            st.session_state['auth_headers'] = headers
+            st.success("Connected!")
+        else:
+            st.stop()
 
-    def ai_score(self, symbol, price, history=None):
-        """
-        Placeholder AI scoring:
-        - Replace this with your LLM or model that returns a score [-1,1]
-        - For now we use a simple randomized score with tiny bias from price moves
-        """
-        return float(np.tanh(np.random.normal(0,1)))
+headers = st.session_state['auth_headers']
 
-    def current_total_exposure_fraction(self):
-        if USE_SIMULATION:
-            used = sum(p["notional"] for p in self.sim.positions.values())
-            cap_val = self.sim.equity * self.cap
-            return used / cap_val if cap_val>0 else 0.0
-        # For LIVE: you should compute used margin from API
-        return 0.0
+# 1. Dashboard (Top)
+col1, col2, col3, col4 = st.columns(4)
+acct_raw = get_account_data(headers)
 
-    def decide(self, prices_map):
-        # For each instrument compute AI score, attempt to open small micro trade on top picks
-        scores = {}
-        for sym, price in prices_map.items():
-            scores[sym] = self.ai_score(sym, price)
-        # pick top positive and top negative scores
-        sorted_syms = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-        # simple strategy: open long on highest positive if exposure allows, short on lowest negative
-        to_try = []
-        if sorted_syms:
-            top_sym, top_score = sorted_syms[0]
-            if top_score > 0.8:
-                to_try.append((top_sym, "long", top_score))
-            bot_sym, bot_score = sorted_syms[-1]
-            if bot_score < -0.8:
-                to_try.append((bot_sym, "short", bot_score))
-        return to_try
+if acct_raw:
+    acct = acct_raw['accounts'][0]['balance']
+    col1.metric("Equity", f"${acct['equity']:.2f}")
+    col2.metric("Available Margin", f"${acct['available']:.2f}")
+    col3.metric("Total P&L", f"${acct['profitLoss']:.2f}", delta_color="normal")
+    col4.metric("Used Margin", f"{acct['margin']:.2f}")
 
-    def execute(self, candidates):
-        for sym, direction, score in candidates:
-            # check exposure cap
-            if self.current_total_exposure_fraction() >= self.cap:
-                self.log.append(f"Exposure cap reached; skip {sym}")
-                continue
-            fraction = self.max_fraction  # fraction of available for this trade
-            if USE_SIMULATION:
-                tid = self.sim.open(sym, direction, fraction)
-                self.open_trades[tid] = {"sym": sym, "dir": direction, "open_price": self.sim.price_map[sym]}
-                self.log.append(f"SIM opened {direction} {sym} tid={tid} at {self.sim.price_map[sym]:.2f} score={score:.2f}")
-            else:
-                status, text = self.client.place_market_order(sym, direction, notional=0)  # notional compute and payload adapt
-                self.log.append(f"LIVE order {sym} {direction} -> {status} {text}")
+    st.markdown("---")
 
-    def maybe_close_some(self):
-        # Aggressive micro exit rule: small probability to close oldest
-        if USE_SIMULATION and self.open_trades:
-            if np.random.rand() < 0.6:
-                tid = next(iter(self.open_trades.keys()))
-                realized = self.sim.close(tid)
-                self.log.append(f"SIM closed {tid} realized {realized:.2f}")
-                self.open_trades.pop(tid, None)
+    # 2. AI & Market Data
+    market_raw = get_market_price(headers, target_asset)
+    positions = get_open_positions(headers)
+    
+    col_ai, col_mkt = st.columns([2, 1])
+    
+    with col_mkt:
+        st.subheader("Market Data")
+        if market_raw:
+            snapshot = market_raw.get('snapshot', {})
+            st.write(f"**Asset:** {target_asset}")
+            st.write(f"**Bid:** {snapshot.get('bid')}")
+            st.write(f"**Ask:** {snapshot.get('offer')}")
+            st.write(f"**Change:** {snapshot.get('dailyChange')}%")
+        else:
+            st.error("Market closed or invalid Epic.")
 
-# ---------- UI layout ----------
-st.title("MicroTrader — Diversified portfolio")
-top1, top2, top3 = st.columns([3,2,4])
-
-with top1:
-    st.subheader("Account overview")
-    total_assets_el = st.empty()
-    equity_el = st.empty()
-    available_el = st.empty()
-    pnl_el = st.empty()
-
-with top2:
-    st.subheader("Controls")
-    st.write("Mode:", MODE)
-    st.write("Max fraction / trade:", f"{MAX_RISK_FRACTION:.2f}")
-    st.write("Total exposure cap:", f"{TOTAL_POSITION_CAP:.2f}")
-
-with top3:
-    st.subheader("AI Log")
-    log_el = st.empty()
-
-st.subheader("Open trades")
-trades_el = st.empty()
-
-# instantiate
-client = None
-sim = None
-if USE_SIMULATION:
-    sim = Simulator(starting_equity=20000.0)
-    trader = MicroTrader(client=None, sim=sim, max_fraction=MAX_RISK_FRACTION, cap=TOTAL_POSITION_CAP)
-else:
-    client = CapitalClient(CAP_API_KEY, CAP_EMAIL, CAP_PASSWORD)
-    ok, resp = client.start_session()
-    if not ok:
-        st.error(f"Login/session failed: {resp}")
-        st.stop()
-    trader = MicroTrader(client=client, sim=None, max_fraction=MAX_RISK_FRACTION, cap=TOTAL_POSITION_CAP)
-
-# background loop
-stop_event = threading.Event()
-
-def loop():
-    while not stop_event.is_set():
-        try:
-            if USE_SIMULATION:
-                prices = sim.step_prices()  # dict symbol->price
-                equity, available, total_pnl = sim.update()
-            else:
-                # live: bulk price fetch
-                prices = {}
-                for sym in INSTRUMENTS:
-                    okp, pdata = client.get_price(sym)
-                    if okp and isinstance(pdata, dict):
-                        # adapt to response shape; common fields are 'bid', 'ask', 'snapshot'
-                        prices[sym] = pdata.get("mid") or pdata.get("bid") or pdata.get("price") or 0.0
+    with col_ai:
+        st.subheader("AI Strategy Log")
+        if st.button("RUN AI ANALYSIS NOW"):
+            with st.spinner("Gemini is analyzing market structure..."):
+                decision = ai_strategy_decision(market_raw, acct_raw, positions)
+                
+                st.info(f"**Decision:** {decision['decision']}")
+                st.write(f"**Reasoning:** {decision['reasoning']}")
+                st.progress(int(decision['confidence']))
+                
+                # EXECUTION LOGIC (Stubbed for safety)
+                if decision['decision'] in ["BUY", "SELL"] and int(decision['confidence']) > 70:
+                    st.write(f"🚀 **Action Triggered:** Attempting to {decision['decision']} {target_asset}")
+                    if trade_mode == "Live (DANGEROUS)":
+                        # Actual API call to place trade would go here
+                        # requests.post(f"{BASE_URL}/api/v1/positions", ...)
+                        st.error("Live execution paused for safety in this template.")
                     else:
-                        prices[sym] = 0.0
-                ok_acc, acc = client.get_account_summary()
-                if ok_acc:
-                    equity = acc["equity"]
-                    available = acc["available"]
-                    total_pnl = acc["pnl"]
-                else:
-                    equity = 0.0; available = 0.0; total_pnl = 0.0
+                        st.success("Paper Trade Simulated Successfully.")
 
-            # update top UI
-            total_assets_el.markdown(f"**Total assets:** {equity:,.2f}")
-            equity_el.markdown(f"**Equity:** {equity:,.2f}")
-            available_el.markdown(f"**Available:** {available:,.2f}")
-            pnl_el.markdown(f"**P&L:** {total_pnl:,.2f}")
+    st.markdown("---")
 
-            # strategy decide & execute
-            candidates = trader.decide(prices)
-            trader.execute(candidates)
-            trader.maybe_close_some()
-
-            # trades display
-            if USE_SIMULATION:
-                df = []
-                for tid, p in sim.positions.items():
-                    price = sim.price_map[p["sym"]]
-                    df.append({"id": tid, "symbol": p["sym"], "dir": p["direction"], "open_price": p["open_price"], "current_price": price, "pnl": p["pnl"]})
-                trades_el.dataframe(pd.DataFrame(df))
-            else:
-                okpos, posdata = client.get_open_positions()
-                if okpos and isinstance(posdata, (dict, list)):
-                    # adapt parse
-                    trades_el.write(posdata)
-                else:
-                    trades_el.write("No open positions or could not fetch.")
-
-            # logs
-            log_el.text("\n".join(trader.log[-40:]))
-
-        except Exception as e:
-            st.error(f"Error in loop: {e}")
-        time.sleep(TICK_INTERVAL)
-
-if st.button("Start"):
-    if "thread" not in st.session_state:
-        st.session_state.thread = threading.Thread(target=loop, daemon=True)
-        st.session_state.thread.start()
-        st.success("Loop started.")
+    # 3. Open Positions Table
+    st.subheader("Aggressive Positions (Open)")
+    if positions:
+        df = pd.DataFrame(positions)
+        # Select relevant columns for display
+        display_df = df[['dealId', 'epic', 'direction', 'openPrice', 'size', 'profitAndLoss']]
+        st.dataframe(display_df, use_container_width=True)
     else:
-        st.info("Already running")
+        st.write("No open positions. AI is waiting for entry.")
 
-if st.button("Stop"):
-    stop_event.set()
-    st.session_state.pop("thread", None)
-    st.warning("Stopped")
-
-st.caption("Demo code — adapt order payloads & endpoints for your account. Use SIMULATION mode first.")
+else:
+    st.error("Failed to fetch account data. Please check your token expiration.")
