@@ -37,7 +37,6 @@ except:
     st.stop()
 
 genai.configure(api_key=GEMINI_KEY)
-# Using Flash Lite for speed
 model = genai.GenerativeModel('gemini-2.5-flash-lite')
 
 # --- STATE ---
@@ -79,7 +78,11 @@ def get_positions(headers):
 
 def execute_trade(headers, epic, direction, size):
     payload = {"epic": epic, "direction": direction, "size": size, "guaranteedStop": False, "trailingStop": False}
-    requests.post(POSITIONS_URL, json=payload, headers=headers)
+    return requests.post(POSITIONS_URL, json=payload, headers=headers)
+
+def close_position(headers, deal_id):
+    """Closes a specific trade"""
+    return requests.delete(f"{POSITIONS_URL}/{deal_id}", headers=headers)
 
 def fetch_market_batch(headers, assets):
     batch_data = []
@@ -98,56 +101,96 @@ def fetch_market_batch(headers, assets):
         except: pass
     return batch_data
 
+# --- AI BRAINS ---
+
 def analyze_portfolio_aggressive(market_data_list):
-    """
-    FORCED TRADING PROMPT
-    """
+    """Brain 1: Finds NEW trades"""
     data_str = json.dumps(market_data_list, indent=2)
-    
     prompt = f"""
-    You are a DEGENERATE HIGH-FREQUENCY SCALPER.
+    You are a DEGENERATE SCALPER.
     Live Data: {data_str}
-    
-    RULES:
-    1. You MUST pick the top 3 assets to trade. Do NOT return an empty list.
-    2. Ignore safety. We want volume.
-    3. If momentum is slightly up, BUY. If slightly down, SELL.
-    4. Even 0.1% change is enough to trade.
-    
-    RESPONSE JSON LIST:
-    [
-        {{"asset": "BTCUSD", "action": "BUY", "confidence": 90, "reason": "Slight pump"}},
-        ...
-    ]
+    RULES: Pick Top 3 assets. Ignore safety. If momentum exists, trade it.
+    RESPONSE JSON LIST: [{{"asset": "BTCUSD", "action": "BUY", "confidence": 90, "reason": "Pump"}}, ...]
     """
-    
     try:
         response = model.generate_content(prompt)
         text = response.text.replace("```json", "").replace("```", "").strip()
         st.session_state["last_raw"] = text
         return json.loads(text)
-    except Exception as e:
-        st.session_state["last_raw"] = str(e)
-        return []
+    except: return []
+
+def manage_positions_ai(positions_data):
+    """Brain 2: Decides to HOLD or CLOSE existing trades"""
+    if not positions_data: return []
+    
+    # Create simple summary for AI
+    summary = []
+    for p in positions_data:
+        summary.append({
+            "dealId": p['dealId'],
+            "asset": p['epic'],
+            "direction": p['direction'],
+            "pnl": p['profitAndLoss'],
+            "entry": p['openPrice']
+        })
+        
+    data_str = json.dumps(summary, indent=2)
+    prompt = f"""
+    You are a RISK MANAGER.
+    Here are my open positions:
+    {data_str}
+    
+    TASK: Decide to CLOSE or HOLD.
+    RULES:
+    1. If profit is good (> $2), CLOSE to take profit.
+    2. If loss is getting bad (< -$10), CLOSE to stop loss.
+    3. If mostly flat, HOLD.
+    
+    RESPONSE JSON LIST:
+    [{{"dealId": "123", "action": "CLOSE", "reason": "Taking profit"}}, {{"dealId": "456", "action": "HOLD", "reason": "Waiting"}}]
+    """
+    try:
+        response = model.generate_content(prompt)
+        text = response.text.replace("```json", "").replace("```", "").strip()
+        return json.loads(text)
+    except: return []
 
 # --- UI LAYOUT ---
 
 st.title(f"💀 Hyper-Aggressive Scalper")
-
-with st.sidebar:
-    st.header("Control")
-    run_bot = st.toggle("ACTIVATE SCALPER", key="run_bot")
-    if st.button("Reconnect"):
-        st.session_state["headers"] = get_session()
-        st.rerun()
-    with st.expander("Debug Raw AI"):
-        st.code(st.session_state["last_raw"], language="json")
 
 # Connect
 headers = st.session_state["headers"]
 if not headers:
     headers = get_session()
     st.session_state["headers"] = headers
+
+# --- SIDEBAR: MANUAL TRADE ---
+with st.sidebar:
+    st.header("🎮 Manual Control")
+    
+    with st.form("manual_trade_form"):
+        m_asset = st.selectbox("Asset", PORTFOLIO)
+        m_action = st.radio("Direction", ["BUY", "SELL"], horizontal=True)
+        m_size = st.number_input("Size", min_value=0.01, value=1.0, step=0.1)
+        
+        submitted = st.form_submit_button("🔥 FORCE OPEN TRADE")
+        if submitted and headers:
+            res = execute_trade(headers, m_asset, m_action, m_size)
+            if res.status_code == 200:
+                st.success(f"Opened {m_action} {m_asset}")
+                time.sleep(1)
+                st.rerun()
+            else:
+                st.error(f"Failed: {res.text}")
+
+    st.divider()
+    
+    st.header("🤖 Auto-Bot")
+    run_bot = st.toggle("ACTIVATE SCALPER", key="run_bot")
+    if st.button("Reconnect"):
+        st.session_state["headers"] = get_session()
+        st.rerun()
 
 if headers:
     acct = get_account_safe(headers)
@@ -157,7 +200,7 @@ if headers:
 
     if acct:
         # 1. METRICS
-        equity = acct.get('equity', acct.get('balance', 0) + acct.get('profitLoss', 0))
+        equity = acct.get('equity', 0)
         avail = acct.get('available', 0)
         positions = get_positions(headers)
 
@@ -179,72 +222,66 @@ if headers:
                 column_config={"profitAndLoss": st.column_config.NumberColumn("P&L", format="$%.2f")}
             )
         else:
-            st.info("No trades yet. Bot will open some soon.")
-
-        st.divider()
+            st.info("No trades yet.")
 
         # 3. LIVE LOGS
         with st.expander("📜 Live Action Log", expanded=True):
             if st.session_state["log_history"]:
-                log_df = pd.DataFrame(st.session_state["log_history"])
-                st.dataframe(log_df, use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(st.session_state["log_history"]), use_container_width=True, hide_index=True)
             else:
-                st.caption("Waiting for first aggressive scan...")
+                st.caption("Log empty...")
 
-        # --- EXECUTION LOOP ---
+        # --- MAIN LOOP ---
         if run_bot:
             status_box = st.empty()
             
-            # Select 10 assets for max coverage
+            # --- PART A: MANAGE EXISTING TRADES ---
+            if positions:
+                with status_box.status("🛡️ AI Checking Existing Positions...", expanded=True) as status:
+                    decisions = manage_positions_ai(positions)
+                    for dec in decisions:
+                        if dec.get('action') == "CLOSE":
+                            deal_id = dec.get('dealId')
+                            close_position(headers, deal_id)
+                            st.toast(f"💰 CLOSED POSITION: {dec.get('reason')}")
+                            st.session_state["log_history"].insert(0, {
+                                "Time": datetime.now().strftime("%H:%M:%S"),
+                                "Action": "CLOSE",
+                                "Asset": "Existing",
+                                "Reason": dec.get('reason')
+                            })
+                    status.write("Position check complete.")
+
+            # --- PART B: HUNT NEW TRADES ---
             batch = random.sample(PORTFOLIO, 10)
-            
-            with status_box.status(f"⚡ Aggressively Scanning 10 Assets...", expanded=True) as status:
-                
-                # A. Fetch
+            with status_box.status(f"⚡ Hunting New Trades...", expanded=True) as status:
                 market_data = fetch_market_batch(headers, batch)
-                
                 if market_data:
-                    # B. Force AI Decision
                     decisions = analyze_portfolio_aggressive(market_data)
-                    
-                    timestamp = datetime.now().strftime("%H:%M:%S")
-                    
                     if decisions:
-                        status.write(f"AI identified {len(decisions)} trades!")
-                        
+                        status.write(f"AI found {len(decisions)} opportunities!")
                         for dec in decisions:
                             asset = dec.get('asset')
                             action = dec.get('action')
                             conf = dec.get('confidence', 0)
-                            reason = dec.get('reason', '-')
                             
-                            # Log
-                            st.session_state["log_history"].insert(0, {
-                                "Time": timestamp,
-                                "Action": f"{action} ({conf}%)",
-                                "Asset": asset,
-                                "Reason": reason
-                            })
-                            
-                            # C. LOW THRESHOLD EXECUTION (Conf > 40 is enough)
                             if action in ["BUY", "SELL"] and conf > 40:
                                 if avail > 100:
-                                    # Aggressive Sizing
-                                    size = 0.02 if "BTC" in asset else 2
+                                    size = 0.02 if "BTC" in asset else 1.0
                                     execute_trade(headers, asset, action, size)
                                     st.toast(f"💣 OPENED: {action} {asset}")
-                                    time.sleep(0.2) # Fast fire
-                            else:
-                                status.write(f"Skipped {asset} (Conf {conf}% < 40%)")
-                                
-                        # Trim Log
-                        if len(st.session_state["log_history"]) > 20: 
-                            st.session_state["log_history"] = st.session_state["log_history"][:20]
-                    else:
-                        status.write("AI failed to pick trades (Rare).")
+                                    st.session_state["log_history"].insert(0, {
+                                        "Time": datetime.now().strftime("%H:%M:%S"),
+                                        "Action": action,
+                                        "Asset": asset,
+                                        "Reason": dec.get('reason')
+                                    })
+                                    time.sleep(0.2)
+                    
+                    if len(st.session_state["log_history"]) > 20: 
+                        st.session_state["log_history"] = st.session_state["log_history"][:20]
 
-            # D. SHORT COOLDOWN (30s)
-            # Faster than 60s, risking rate limits for aggression
+            # D. COOLDOWN (30s)
             for s in range(30, 0, -1):
                 status_box.info(f"🔥 reloading... {s}s")
                 time.sleep(1)
