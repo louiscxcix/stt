@@ -6,12 +6,12 @@ import time
 from datetime import datetime
 import pytz
 import random
+import json
 
 # --- CONFIGURATION ---
-st.set_page_config(page_title="Ultra-Aggressive Trader", layout="wide", page_icon="💀")
+st.set_page_config(page_title="AI Neural Trader", layout="wide", page_icon="🧠")
 
-# ⚠️ LIVE TRADING URL (Switch carefully)
-# BASE_URL = "https://api-capital.backend-capital.com"
+# ⚠️ DEMO API (Switch to live only when ready)
 BASE_URL = "https://demo-api-capital.backend-capital.com" 
 
 SESSION_URL = f"{BASE_URL}/api/v1/session"
@@ -19,240 +19,229 @@ ACCOUNTS_URL = f"{BASE_URL}/api/v1/accounts"
 POSITIONS_URL = f"{BASE_URL}/api/v1/positions"
 MARKETS_URL = f"{BASE_URL}/api/v1/markets"
 
-# AGGRESSIVE WATCHLIST (Popular Volatile Assets)
 WATCHLIST = ["BTCUSD", "ETHUSD", "EURUSD", "GBPUSD", "GOLD", "US500", "TSLA", "AAPL"]
 
-# --- SETUP SECRETS ---
+# --- SECRETS CHECK ---
 try:
     CAP_API_KEY = st.secrets["capital_com"]["api_key"]
     CAP_EMAIL = st.secrets["capital_com"]["email"]
     CAP_PASSWORD = st.secrets["capital_com"]["password"]
     GEMINI_KEY = st.secrets["gemini"]["GEMINI_API_KEY"]
 except:
-    st.error("❌ SECRETS MISSING! Please check .streamlit/secrets.toml")
+    st.error("❌ Secrets missing! Check .streamlit/secrets.toml")
     st.stop()
 
 genai.configure(api_key=GEMINI_KEY)
 model = genai.GenerativeModel('gemini-pro')
 
-# --- STATE MANAGEMENT ---
-if "log_history" not in st.session_state:
-    st.session_state["log_history"] = []
-if "system_logs" not in st.session_state:
-    st.session_state["system_logs"] = []
+# --- SESSION STATE INITIALIZATION ---
+if "log_history" not in st.session_state: st.session_state["log_history"] = []
+if "headers" not in st.session_state: st.session_state["headers"] = None
+if "last_prompt" not in st.session_state: st.session_state["last_prompt"] = "Waiting for start..."
+if "last_response" not in st.session_state: st.session_state["last_response"] = "Waiting for start..."
 
-def add_log(asset, action, conf, price, note=""):
-    timestamp = datetime.now().strftime("%H:%M:%S")
-    entry = {
-        "Time": timestamp,
-        "Asset": asset,
-        "Price": price,
-        "Decision": action,
-        "Conf": f"{conf}%",
-        "Note": note
-    }
-    st.session_state["log_history"].insert(0, entry)
-    # Keep last 20
-    if len(st.session_state["log_history"]) > 20:
-        st.session_state["log_history"] = st.session_state["log_history"][:20]
-
-def log_system(msg):
-    timestamp = datetime.now().strftime("%H:%M:%S")
-    st.session_state["system_logs"].insert(0, f"[{timestamp}] {msg}")
-
-# --- API FUNCTIONS ---
+# --- HELPER FUNCTIONS ---
 
 def get_session():
+    """Connects to Capital.com"""
     headers = {"X-CAP-API-KEY": CAP_API_KEY, "Content-Type": "application/json"}
     data = {"identifier": CAP_EMAIL, "password": CAP_PASSWORD}
     try:
         resp = requests.post(SESSION_URL, json=data, headers=headers)
         if resp.status_code == 200:
-            log_system("✅ Connected to Capital.com")
             return {
                 "CST": resp.headers["CST"],
                 "X-SECURITY-TOKEN": resp.headers["X-SECURITY-TOKEN"],
                 "X-CAP-API-KEY": CAP_API_KEY,
                 "Content-Type": "application/json"
             }
-        else:
-            log_system(f"❌ Login Failed: {resp.status_code} - {resp.text}")
-    except Exception as e:
-        log_system(f"❌ Connection Error: {e}")
+    except: pass
     return None
 
-def get_account_details(headers):
+def get_account_safe(headers):
+    """Fetches account info safely"""
     try:
         resp = requests.get(ACCOUNTS_URL, headers=headers)
         if resp.status_code == 200:
-            data = resp.json()
-            if 'accounts' in data:
-                return data['accounts'][0]['balance']
+            return resp.json()['accounts'][0]['balance']
         elif resp.status_code == 401:
             return "UNAUTHORIZED"
-        else:
-            log_system(f"⚠️ Account Fetch Fail: {resp.status_code}")
-    except Exception as e:
-        log_system(f"⚠️ Account Error: {e}")
+    except: pass
     return None
 
 def get_positions(headers):
     try:
         resp = requests.get(POSITIONS_URL, headers=headers)
-        if resp.status_code == 200:
-            return resp.json().get('positions', [])
-        else:
-            log_system(f"⚠️ Position Fetch Fail: {resp.text}")
-    except Exception as e:
-        log_system(f"⚠️ Position Error: {e}")
+        if resp.status_code == 200: return resp.json().get('positions', [])
+    except: pass
     return []
 
 def execute_trade(headers, epic, direction, size):
-    payload = {
-        "epic": epic,
-        "direction": direction,
-        "size": size,
-        "guaranteedStop": False,
-        "trailingStop": False
-    }
-    try:
-        resp = requests.post(POSITIONS_URL, json=payload, headers=headers)
-        if resp.status_code == 200:
-            log_system(f"🚀 TRADE SUCCESS: {direction} {epic}")
-            return True
-        else:
-            log_system(f"❌ TRADE FAILED: {resp.text}")
-            return False
-    except Exception as e:
-        log_system(f"❌ Execution Error: {e}")
-        return False
+    payload = {"epic": epic, "direction": direction, "size": size, "guaranteedStop": False, "trailingStop": False}
+    requests.post(POSITIONS_URL, json=payload, headers=headers)
 
-def ai_brain(epic, price, change):
-    # Aggressive Prompt
-    prompt = f"""
-    You are a reckless crypto/stock trader.
-    Asset: {epic}
-    Price: {price}
-    Change: {change}%
-    
-    TASK: Decided BUY or SELL immediately.
-    Constraint: You CANNOT say WAIT unless market is closed.
-    
-    Return JSON: {{"action": "BUY" or "SELL", "confidence": 0-100, "reason": "short text"}}
+def ask_gemini(epic, price, change):
     """
+    Communicates with Gemini API.
+    Returns: (Decision Dict, Raw Prompt String, Raw Response String)
+    """
+    # 1. Construct the Prompt (The input to the Brain)
+    prompt = f"""
+    Act as a high-frequency trading algorithm.
+    Current Market Data:
+    - Asset: {epic}
+    - Price: {price}
+    - Daily Change: {change}%
+    
+    INSTRUCTIONS:
+    1. Analyze the change. If it is moving fast, jump in.
+    2. Output strictly JSON.
+    3. Format: {{"action": "BUY" or "SELL" or "WAIT", "confidence": 0-100, "reason": "brief reason"}}
+    """
+    
     try:
-        resp = model.generate_content(prompt)
-        text = resp.text.replace("```json", "").replace("```", "").strip()
-        import json
-        return json.loads(text)
+        # 2. Send to Google (The Communication)
+        response = model.generate_content(prompt)
+        
+        # 3. Clean the Response
+        raw_text = response.text
+        clean_json = raw_text.replace("```json", "").replace("```", "").strip()
+        
+        return json.loads(clean_json), prompt, raw_text
     except Exception as e:
-        log_system(f"AI Error: {e}")
-        return {"action": "WAIT", "confidence": 0, "reason": "AI Fail"}
+        return {"action": "WAIT", "confidence": 0, "reason": str(e)}, prompt, str(e)
 
-# --- APP LAYOUT ---
+# --- DASHBOARD UI ---
 
-st.title("💀 Aggressive Auto-Trader (Debug Mode)")
+st.title("🧠 Transparent AI Trader")
 
-if "headers" not in st.session_state:
-    st.session_state["headers"] = get_session()
-
-# Sidebar
+# Sidebar Controls
 with st.sidebar:
-    run_bot = st.toggle("ACTIVATE BOT", value=False, key="active")
-    if st.button("♻️ Reconnect"):
-        st.session_state["headers"] = get_session()
-    
-    st.divider()
-    st.subheader("System Logs")
-    # Show last 10 system logs
-    for log in st.session_state["system_logs"][:10]:
-        st.caption(log)
-
-# Main Dashboard
-headers = st.session_state["headers"]
-
-if not headers:
-    st.warning("Not Connected. Click Reconnect.")
-    if run_bot: st.stop()
-else:
-    # 1. Account Info
-    raw_bal = get_account_details(headers)
-    
-    if raw_bal == "UNAUTHORIZED":
-        log_system("Token Expired. Refreshing...")
+    st.header("Control Center")
+    run_bot = st.toggle("ACTIVATE BOT", key="bot_active")
+    if st.button("Force Reconnect"):
         st.session_state["headers"] = get_session()
         st.rerun()
-        
-    if raw_bal and isinstance(raw_bal, dict):
-        equity = raw_bal.get('equity', 0)
-        # Fallback calculation if API returns 0 equity
-        if equity == 0:
-            equity = raw_bal.get('balance', 0) + raw_bal.get('profitLoss', 0)
-            
-        avail = raw_bal.get('available', 0)
-        pnl = raw_bal.get('profitLoss', 0)
-        
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Equity", f"${equity:,.2f}")
-        c2.metric("Available", f"${avail:,.2f}")
-        c3.metric("P&L", f"${pnl:,.2f}", delta=pnl)
-        
+
+# 1. Connect
+headers = st.session_state["headers"]
+if not headers:
+    headers = get_session()
+    st.session_state["headers"] = headers
+
+if headers:
+    acct = get_account_safe(headers)
+    
+    # Auth Check
+    if acct == "UNAUTHORIZED":
+        st.session_state["headers"] = get_session()
+        st.rerun()
+    
+    if acct:
+        # --- TOP METRICS ---
+        equity = acct.get('equity', acct.get('balance', 0) + acct.get('profitLoss', 0))
+        avail = acct.get('available', 0)
         positions = get_positions(headers)
-        c4.metric("Open Trades", len(positions))
+        
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Equity", f"${equity:,.0f}")
+        m2.metric("Available", f"${avail:,.0f}")
+        m3.metric("P&L", f"${acct.get('profitLoss', 0):,.2f}")
+        m4.metric("Active Trades", len(positions))
 
-        # 2. Open Trades Table
-        st.subheader("⚔️ Active Positions")
-        if positions:
-            df = pd.DataFrame(positions)
-            st.dataframe(df[['epic', 'direction', 'size', 'openPrice', 'profitAndLoss']], use_container_width=True)
-        else:
-            st.info("No open trades.")
+        st.divider()
 
-        # 3. AI Stream
-        st.subheader("🧠 AI Thought Stream")
-        if st.session_state["log_history"]:
-            st.dataframe(pd.DataFrame(st.session_state["log_history"]), use_container_width=True)
-        else:
-            st.write("Waiting for analysis...")
-
-        # --- TRADING LOOP ---
-        if run_bot:
-            # Pick ONE asset to process (avoids blocking UI)
-            target = random.choice(WATCHLIST)
+        # --- LIVE AI WIRETAP (THE "HOW IT WORKS" PART) ---
+        c1, c2 = st.columns(2)
+        
+        with c1:
+            st.subheader("📡 Outgoing -> Gemini API")
+            st.caption("This is the exact data packet we send to Google:")
+            st.code(st.session_state["last_prompt"], language="text")
             
-            # 1. Fetch Market
-            try:
-                mkt_resp = requests.get(f"{MARKETS_URL}/{target}", headers=headers)
-                if mkt_resp.status_code == 200:
-                    mkt_data = mkt_resp.json()
+        with c2:
+            st.subheader("📥 Incoming <- Gemini API")
+            st.caption("This is the raw logic returned by the AI:")
+            st.code(st.session_state["last_response"], language="json")
+
+        st.divider()
+
+        # --- LOGS & TRADES ---
+        c_log, c_pos = st.columns(2)
+        
+        with c_log:
+            st.subheader("📜 AI Thought History")
+            if st.session_state["log_history"]:
+                df_log = pd.DataFrame(st.session_state["log_history"])
+                st.dataframe(df_log, use_container_width=True, hide_index=True)
+            else:
+                st.info("Log empty. Activate bot to start scanning.")
+
+        with c_pos:
+            st.subheader("⚔️ Open Positions")
+            if positions:
+                st.dataframe(pd.DataFrame(positions)[['epic', 'direction', 'profitAndLoss']], use_container_width=True)
+            else:
+                st.info("No open trades.")
+
+        # --- MAIN EXECUTION LOOP ---
+        if run_bot:
+            with st.status("🤖 AI is thinking...", expanded=True) as status:
+                
+                # 1. Pick Target
+                target = random.choice(WATCHLIST)
+                status.write(f"Scanning market for: **{target}**")
+                
+                try:
+                    # 2. Fetch Market Data
+                    mkt = requests.get(f"{MARKETS_URL}/{target}", headers=headers).json()
                     
-                    if 'snapshot' in mkt_data:
-                        price = mkt_data['snapshot']['offer']
-                        change = mkt_data['snapshot']['dailyChange']
+                    if 'snapshot' in mkt:
+                        snap = mkt['snapshot']
+                        price = snap.get('offer', snap.get('bid', 0))
+                        change = snap.get('dailyChange', 0)
                         
-                        # 2. AI Decision
-                        dec = ai_brain(target, price, change)
-                        action = dec.get('action', 'WAIT')
-                        conf = int(dec.get('confidence', 0))
-                        reason = dec.get('reason', '')
+                        status.write(f"Data acquired: Price ${price} | Change {change}%")
                         
-                        add_log(target, action, conf, price, reason)
+                        # 3. ASK GEMINI (Capture Inputs/Outputs)
+                        decision, raw_prompt, raw_resp = ask_gemini(target, price, change)
                         
-                        # 3. Execution (Threshold 60%)
+                        # Save for UI Display
+                        st.session_state["last_prompt"] = raw_prompt
+                        st.session_state["last_response"] = raw_resp
+                        
+                        action = decision.get('action', 'WAIT')
+                        conf = decision.get('confidence', 0)
+                        
+                        # 4. Update Logs
+                        timestamp = datetime.now().strftime("%H:%M:%S")
+                        new_log = {
+                            "Time": timestamp, 
+                            "Asset": target, 
+                            "Action": action, 
+                            "Conf": f"{conf}%",
+                            "Reason": decision.get("reason", "-")
+                        }
+                        st.session_state["log_history"].insert(0, new_log)
+                        # Keep list short
+                        if len(st.session_state["log_history"]) > 10:
+                            st.session_state["log_history"].pop()
+
+                        # 5. Execute Trade
                         if action in ["BUY", "SELL"] and conf > 60:
-                            # Verify Funds
-                            if avail > 50: # Minimum buffer
+                            if avail > 100: # Check funds
+                                status.write(f"🚀 EXECUTING {action}!")
                                 size = 0.01 if "BTC" in target else 1
                                 execute_trade(headers, target, action, size)
+                                st.toast(f"Trade Sent: {action} {target}")
                             else:
-                                log_system("❌ Insufficient Funds for Trade")
-                    else:
-                        log_system(f"⚠️ No snapshot for {target}")
-                else:
-                    log_system(f"⚠️ Market Fetch Fail {target}: {mkt_resp.status_code}")
-                    
-            except Exception as e:
-                log_system(f"❌ Loop Error: {e}")
+                                st.warning("Insufficient funds")
+                        else:
+                            status.write("Confidence too low. Waiting.")
 
-            time.sleep(1)
+                except Exception as e:
+                    status.write(f"Error: {e}")
+            
+            # Short pause then refresh UI
+            time.sleep(1.5)
             st.rerun()
