@@ -14,20 +14,19 @@ from Crypto.Cipher import PKCS1_v1_5
 class CapitalClient:
     def __init__(self):
         try:
-            # --- SECRETS LOADING ---
             self.cap_key = st.secrets["capital_com"]["api_key"]
             self.login = st.secrets["capital_com"]["email"]
             self.password = st.secrets["capital_com"]["password"]
             
-            # --- GEMINI SETUP (FIXED MODEL NAME) ---
+            # --- GEMINI SETUP WITH FALLBACKS ---
             genai.configure(api_key=st.secrets["gemini"]["GEMINI_API_KEY"])
             
-            # UPDATED MODEL: Using 'gemini-1.5-flash' for speed/stability
-            self.model = genai.GenerativeModel('gemini-1.5-flash')
+            # Default to Flash, but we will handle errors dynamically
+            self.model_name = 'gemini-1.5-flash'
+            self.model = genai.GenerativeModel(self.model_name)
             
         except Exception as e:
             st.error(f"❌ Connection Error: {e}")
-            st.info("Check .streamlit/secrets.toml variable names.")
             st.stop()
         
         self.base_url = "https://demo-api-capital.backend-capital.com"
@@ -46,20 +45,15 @@ class CapitalClient:
 
     def connect(self):
         try:
-            # 1. Get Encryption Key
             r = self.session.get(f"{self.base_url}/api/v1/session/encryptionKey", headers={'X-CAP-API-KEY': self.cap_key})
-            
             if r.status_code == 401:
-                st.error("❌ Capital.com API Key Rejected. Check your Key in secrets.toml")
+                st.error("❌ Capital API Key Rejected.")
                 return False
-                
             r.raise_for_status()
             data = r.json()
             
-            # 2. Encrypt Password
             pw = self._encrypt_password(data['encryptionKey'], int(data['timeStamp']))
             
-            # 3. Create Session
             payload = {"identifier": self.login, "password": pw, "encryptedPassword": True}
             r = self.session.post(f"{self.base_url}/api/v1/session", json=payload, headers={'X-CAP-API-KEY': self.cap_key, 'Content-Type': 'application/json'})
             
@@ -67,11 +61,9 @@ class CapitalClient:
                 self.cst = r.headers.get('CST')
                 self.x_security = r.headers.get('X-SECURITY-TOKEN')
                 return True
-            else:
-                st.error(f"Login Failed: {r.text}")
-                return False
+            return False
         except Exception as e:
-            st.error(f"System Error: {e}")
+            st.error(f"Login Error: {e}")
             return False
 
     def get_market_data(self, epic="ETHUSD"):
@@ -86,7 +78,7 @@ class CapitalClient:
             r = self.session.get(f"{self.base_url}/api/v1/markets/{epic}", headers=headers)
             if r.status_code == 200: price = r.json()['snapshot']['offer']
             
-            # Account Info
+            # Account
             r = self.session.get(f"{self.base_url}/api/v1/accounts", headers=headers)
             if r.status_code == 200: account = r.json()['accounts'][0]['balance']
             
@@ -116,13 +108,26 @@ class CapitalClient:
             for p in r.json()['positions']:
                 self.session.delete(f"{self.base_url}/api/v1/positions/{p['dealId']}", headers=headers)
 
+    # --- ROBUST AI SWITCHER ---
+    def switch_model(self):
+        """ Cycles through known working models if one fails """
+        alternatives = ['gemini-1.5-flash', 'gemini-pro', 'gemini-1.0-pro']
+        try:
+            current_idx = alternatives.index(self.model_name)
+            next_idx = (current_idx + 1) % len(alternatives)
+        except:
+            next_idx = 0
+            
+        self.model_name = alternatives[next_idx]
+        self.model = genai.GenerativeModel(self.model_name)
+        return self.model_name
+
 # ==========================================
-# 2. ROBUST AI MANAGER
+# 2. AI MANAGER
 # ==========================================
 def ask_gemini_aggressive(bot, price, candles):
-    # Validation Check
     if not candles or len(candles) < 3:
-        return "HOLD", "Waiting for candle data..."
+        return "HOLD", "Waiting for data..."
 
     trend_str = " -> ".join([str(c) for c in candles[-5:]]) 
     
@@ -140,7 +145,6 @@ def ask_gemini_aggressive(bot, price, candles):
     Options: CORE BUY, CORE SELL, MICRO BUY, MICRO SELL
     """
     
-    # Explicitly Unblock Safety Filters
     safety_settings = [
         {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
         {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
@@ -155,10 +159,15 @@ def ask_gemini_aggressive(bot, price, candles):
             decision, reason = text.split("|", 1)
             return decision.strip().upper(), reason.strip()
         return "MICRO BUY", "Aggressive Default" 
+        
     except Exception as e:
         error_msg = str(e)
+        
+        # --- SELF HEALING LOGIC ---
         if "404" in error_msg:
-            return "HOLD", "Model Name Error (Check Code)"
+            new_model = bot.switch_model()
+            return "HOLD", f"Model 404. Switched to {new_model}. Retrying next loop..."
+            
         elif "429" in error_msg:
             return "HOLD", "Gemini Rate Limit (Cooling down)"
         else:
@@ -188,7 +197,7 @@ def calculate_trade_size(decision, equity, price):
     return round(size, 2)
 
 # ==========================================
-# 4. UI & MAIN LOOP
+# 4. MAIN UI LOOP
 # ==========================================
 def main():
     st.set_page_config(page_title="AI Scalper", page_icon="⚡", layout="wide")
@@ -208,7 +217,6 @@ def main():
         st.session_state.bot = CapitalClient()
         st.session_state.connected = False
         st.session_state.active = False
-        # Initialize slightly in past to trigger immediately
         st.session_state.last_ai_check = datetime.now() - timedelta(minutes=5) 
         st.session_state.ai_log = []
         st.session_state.midnight_mode = False
@@ -218,6 +226,7 @@ def main():
     # --- SIDEBAR ---
     with st.sidebar:
         st.title("⚡ Scalper Admin")
+        st.caption(f"🤖 Current AI: {bot.model_name}")
         
         if not st.session_state.connected:
             if st.button("🔌 Connect", type="primary"):
@@ -235,7 +244,6 @@ def main():
             else:
                 if c1.button("▶️ START NOW"):
                     st.session_state.active = True
-                    # Force Immediate Trigger
                     st.session_state.last_ai_check = datetime.now() - timedelta(minutes=5)
                     st.rerun()
             
@@ -273,7 +281,7 @@ def main():
         reserve_floor = equity * 0.20
         safe_to_trade = available > reserve_floor
         
-        # 2. AI Cycle (15s)
+        # 2. AI Cycle
         now = datetime.now()
         time_since = (now - st.session_state.last_ai_check).total_seconds()
         
