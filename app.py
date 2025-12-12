@@ -14,29 +14,28 @@ from Crypto.Cipher import PKCS1_v1_5
 class CapitalClient:
     def __init__(self):
         try:
-            # --- SECRETS LOADING (Streamlit Cloud Compatible) ---
-            # These keys must match the [TOML] structure in Streamlit Dashboard
+            # --- SECRETS LOADING ---
             self.cap_key = st.secrets["capital_com"]["api_key"]
             self.login = st.secrets["capital_com"]["email"]
             self.password = st.secrets["capital_com"]["password"]
             
-            # Google Gemini Setup
+            # --- GEMINI SETUP (FIXED MODEL NAME) ---
             genai.configure(api_key=st.secrets["gemini"]["GEMINI_API_KEY"])
-            self.model = genai.GenerativeModel('gemini-pro')
+            
+            # UPDATED MODEL: Using 'gemini-1.5-flash' for speed/stability
+            self.model = genai.GenerativeModel('gemini-1.5-flash')
             
         except Exception as e:
-            st.error(f"❌ Secrets Error: {e}")
-            st.info("Please set up 'Secrets' in your Streamlit Cloud Dashboard.")
+            st.error(f"❌ Connection Error: {e}")
+            st.info("Check .streamlit/secrets.toml variable names.")
             st.stop()
         
-        # API Config
-        self.base_url = "https://demo-api-capital.backend-capital.com" # Use 'api-capital...' for LIVE
+        self.base_url = "https://demo-api-capital.backend-capital.com"
         self.session = requests.Session()
         self.cst = None
         self.x_security = None
 
     def _encrypt_password(self, key_b64, timestamp):
-        """Encrypts password using RSA public key from Capital.com"""
         input_str = f"{self.password}|{timestamp}"
         input_bytes = base64.b64encode(input_str.encode('utf-8'))
         key_bytes = base64.b64decode(key_b64)
@@ -46,13 +45,14 @@ class CapitalClient:
         return base64.b64encode(encrypted).decode('utf-8')
 
     def connect(self):
-        """Establishes session with Capital.com"""
         try:
             # 1. Get Encryption Key
             r = self.session.get(f"{self.base_url}/api/v1/session/encryptionKey", headers={'X-CAP-API-KEY': self.cap_key})
+            
             if r.status_code == 401:
-                st.error("❌ API Key rejected. Check Streamlit Secrets.")
+                st.error("❌ Capital.com API Key Rejected. Check your Key in secrets.toml")
                 return False
+                
             r.raise_for_status()
             data = r.json()
             
@@ -75,7 +75,6 @@ class CapitalClient:
             return False
 
     def get_market_data(self, epic="ETHUSD"):
-        """Fetches Price, Account, Positions, and Candle History in one block"""
         headers = {'X-CAP-API-KEY': self.cap_key, 'CST': self.cst, 'X-SECURITY-TOKEN': self.x_security}
         price = 0
         account = {}
@@ -83,19 +82,19 @@ class CapitalClient:
         candles = []
 
         try:
-            # 1. Price
+            # Price
             r = self.session.get(f"{self.base_url}/api/v1/markets/{epic}", headers=headers)
             if r.status_code == 200: price = r.json()['snapshot']['offer']
             
-            # 2. Account Info
+            # Account Info
             r = self.session.get(f"{self.base_url}/api/v1/accounts", headers=headers)
             if r.status_code == 200: account = r.json()['accounts'][0]['balance']
             
-            # 3. Active Positions
+            # Positions
             r = self.session.get(f"{self.base_url}/api/v1/positions", headers=headers)
             if r.status_code == 200: positions = r.json()['positions']
 
-            # 4. History (for AI Context)
+            # History
             r = self.session.get(f"{self.base_url}/api/v1/prices/{epic}?resolution=MINUTE&max=10", headers=headers)
             if r.status_code == 200: 
                 raw = r.json()['prices']
@@ -105,14 +104,12 @@ class CapitalClient:
         return price, account, positions, candles
 
     def place_order(self, epic, side, size):
-        """Executes a Market Order"""
         headers = {'X-CAP-API-KEY': self.cap_key, 'CST': self.cst, 'X-SECURITY-TOKEN': self.x_security, 'Content-Type': 'application/json'}
         payload = {"epic": epic, "direction": side, "size": size}
         r = self.session.post(f"{self.base_url}/api/v1/positions", json=payload, headers=headers)
         return r.status_code == 200, r.text
 
     def close_all_positions(self):
-        """Panic Button: Closes all open trades"""
         headers = {'X-CAP-API-KEY': self.cap_key, 'CST': self.cst, 'X-SECURITY-TOKEN': self.x_security}
         r = self.session.get(f"{self.base_url}/api/v1/positions", headers=headers)
         if r.status_code == 200:
@@ -120,16 +117,15 @@ class CapitalClient:
                 self.session.delete(f"{self.base_url}/api/v1/positions/{p['dealId']}", headers=headers)
 
 # ==========================================
-# 2. AI STRATEGY ENGINE
+# 2. ROBUST AI MANAGER
 # ==========================================
 def ask_gemini_aggressive(bot, price, candles):
-    # 1. Validation
+    # Validation Check
     if not candles or len(candles) < 3:
-        return "HOLD", "Waiting for data..."
+        return "HOLD", "Waiting for candle data..."
 
     trend_str = " -> ".join([str(c) for c in candles[-5:]]) 
     
-    # 2. Prompt Engineering
     prompt = f"""
     You are an Ultra-Aggressive Crypto Scalper. 
     Asset: ETH/USD. Price: {price}.
@@ -144,7 +140,7 @@ def ask_gemini_aggressive(bot, price, candles):
     Options: CORE BUY, CORE SELL, MICRO BUY, MICRO SELL
     """
     
-    # 3. Disable Safety Filters for Financial Data
+    # Explicitly Unblock Safety Filters
     safety_settings = [
         {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
         {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
@@ -161,11 +157,15 @@ def ask_gemini_aggressive(bot, price, candles):
         return "MICRO BUY", "Aggressive Default" 
     except Exception as e:
         error_msg = str(e)
-        if "429" in error_msg: return "HOLD", "Rate Limit (Cooling)"
-        return "HOLD", f"API Fail: {error_msg[:20]}"
+        if "404" in error_msg:
+            return "HOLD", "Model Name Error (Check Code)"
+        elif "429" in error_msg:
+            return "HOLD", "Gemini Rate Limit (Cooling down)"
+        else:
+            return "HOLD", f"API Fail: {error_msg[:20]}"
 
 # ==========================================
-# 3. DYNAMIC SIZING ENGINE
+# 3. DYNAMIC SIZING
 # ==========================================
 def calculate_trade_size(decision, equity, price):
     if price == 0: return 0
@@ -188,12 +188,11 @@ def calculate_trade_size(decision, equity, price):
     return round(size, 2)
 
 # ==========================================
-# 4. STREAMLIT UI & MAIN LOOP
+# 4. UI & MAIN LOOP
 # ==========================================
 def main():
     st.set_page_config(page_title="AI Scalper", page_icon="⚡", layout="wide")
     
-    # CSS for Metrics
     st.markdown("""
         <style>
         div[data-testid="metric-container"] {
@@ -205,18 +204,18 @@ def main():
         </style>
     """, unsafe_allow_html=True)
 
-    # Initialize Session State
     if 'bot' not in st.session_state:
         st.session_state.bot = CapitalClient()
         st.session_state.connected = False
         st.session_state.active = False
+        # Initialize slightly in past to trigger immediately
         st.session_state.last_ai_check = datetime.now() - timedelta(minutes=5) 
         st.session_state.ai_log = []
         st.session_state.midnight_mode = False
 
     bot = st.session_state.bot
 
-    # --- SIDEBAR CONTROLS ---
+    # --- SIDEBAR ---
     with st.sidebar:
         st.title("⚡ Scalper Admin")
         
@@ -236,7 +235,7 @@ def main():
             else:
                 if c1.button("▶️ START NOW"):
                     st.session_state.active = True
-                    # Force Immediate Trigger by setting last check to the past
+                    # Force Immediate Trigger
                     st.session_state.last_ai_check = datetime.now() - timedelta(minutes=5)
                     st.rerun()
             
@@ -244,11 +243,11 @@ def main():
                 bot.close_all_positions()
                 st.toast("Dumped all positions.")
 
-    # --- MAIN DASHBOARD ---
+    # --- DASHBOARD ---
     st.title("🤖 AI High-Frequency Scalper")
     
     if not st.session_state.connected:
-        st.info("👈 Please connect using the Sidebar button.")
+        st.info("👈 Connect via Sidebar")
         st.stop()
 
     header_ph = st.empty()
@@ -261,9 +260,9 @@ def main():
         st.subheader("🧠 Neural Feed")
         log_ph = st.empty()
 
-    # --- REAL-TIME LOOP ---
+    # --- LOOP ---
     while True:
-        # 1. Fetch Data
+        # 1. Live Data
         price, account, positions, candles = bot.get_market_data("ETHUSD")
         
         equity = account.get('equity', 0)
@@ -271,11 +270,10 @@ def main():
         margin = account.get('margin', 0)
         pl = account.get('profitLoss', 0)
         
-        # 2. Strategy Logic
         reserve_floor = equity * 0.20
         safe_to_trade = available > reserve_floor
         
-        # 3. AI Cycle (Every 15s to respect Gemini Rate Limits)
+        # 2. AI Cycle (15s)
         now = datetime.now()
         time_since = (now - st.session_state.last_ai_check).total_seconds()
         
@@ -285,13 +283,11 @@ def main():
                     if len(positions) < 5: 
                         decision, reason = ask_gemini_aggressive(bot, price, candles)
                         
-                        # Log Decision
                         timestamp = now.strftime('%H:%M:%S')
                         log_entry = f"[{timestamp}] {decision}: {reason}"
                         st.session_state.ai_log.insert(0, log_entry)
                         st.session_state.last_ai_check = now
                         
-                        # Execute Trade
                         if "BUY" in decision or "SELL" in decision:
                             side = "BUY" if "BUY" in decision else "SELL"
                             size = calculate_trade_size(decision, equity, price)
@@ -301,13 +297,13 @@ def main():
                                 if success:
                                     st.toast(f"⚡ {decision} {size} ETH", icon="🔥")
                                 else:
-                                    st.session_state.ai_log.insert(0, f"[{timestamp}] API FAIL: {msg}")
+                                    st.session_state.ai_log.insert(0, f"[{timestamp}] EXEC FAIL: {msg}")
                     else:
                         st.session_state.ai_log.insert(0, f"[{now.strftime('%H:%M:%S')}] MAX POSITIONS (5). Holding.")
                 else:
                     st.session_state.ai_log.insert(0, "⚠️ LOW CASH RESERVE - Pausing Buys")
 
-        # --- UI REFRESH ---
+        # --- UI UPDATE ---
         with header_ph.container():
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("Equity", f"€{equity:,.2f}")
