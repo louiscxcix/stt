@@ -9,351 +9,328 @@ import random
 import re
 
 # --- CONFIGURATION ---
-st.set_page_config(page_title="AI Portfolio Architect", layout="wide", page_icon="🏗️")
+st.set_page_config(page_title="Capital.com AI Trader", layout="wide", page_icon="📈")
 
 # API ENDPOINTS
-BASE_URL = "[https://demo-api-capital.backend-capital.com](https://demo-api-capital.backend-capital.com)" 
+BASE_URL = "https://demo-api-capital.backend-capital.com" 
 SESSION_URL = f"{BASE_URL}/api/v1/session"
 ACCOUNTS_URL = f"{BASE_URL}/api/v1/accounts"
 POSITIONS_URL = f"{BASE_URL}/api/v1/positions"
 MARKETS_URL = f"{BASE_URL}/api/v1/markets"
 
-# MASSIVE WATCHLIST
+# PORTFOLIO WATCHLIST
 PORTFOLIO = [
-    "BTCUSD", "ETHUSD", "XRPUSD", "LTCUSD", "DOGEUSD", # Crypto
-    "EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD",  # Forex
-    "GOLD", "SILVER", "OIL_CRUDE", "NATURAL_GAS",      # Commodities
-    "US500", "US30", "DE40", "JP225", "FR40",          # Indices
-    "TSLA", "NVDA", "AAPL", "MSFT", "AMZN", "META"     # Stocks
+    "BTCUSD", "ETHUSD", "XRPUSD", "LTCUSD",      # Crypto
+    "EURUSD", "GBPUSD", "USDJPY", "AUDUSD",      # Forex
+    "GOLD", "SILVER", "OIL_CRUDE", "NATURAL_GAS",# Commodities
+    "US500", "US30", "DE40", "JP225",            # Indices
+    "TSLA", "NVDA", "AAPL", "MSFT", "AMZN"       # Stocks
 ]
 
-# --- SECRETS ---
+# --- SECRETS SETUP ---
 try:
     CAP_API_KEY = st.secrets["capital_com"]["api_key"]
     CAP_EMAIL = st.secrets["capital_com"]["email"]
     CAP_PASSWORD = st.secrets["capital_com"]["password"]
     GEMINI_KEY = st.secrets["gemini"]["GEMINI_API_KEY"]
 except:
-    st.error("❌ Secrets missing. Check .streamlit/secrets.toml")
+    st.error("❌ Secrets missing. Please check .streamlit/secrets.toml")
     st.stop()
 
 genai.configure(api_key=GEMINI_KEY)
 model = genai.GenerativeModel('gemini-2.5-flash-lite')
 
-# --- STATE ---
+# --- SESSION STATE ---
 if "log_history" not in st.session_state: st.session_state["log_history"] = []
 if "headers" not in st.session_state: st.session_state["headers"] = None
-if "last_plan_debug" not in st.session_state: st.session_state["last_plan_debug"] = "Waiting..."
+if "connection_status" not in st.session_state: st.session_state["connection_status"] = "Disconnected"
 
-# --- HELPER: JSON CLEANER ---
-def clean_and_parse_json(raw_text):
-    """
-    Robustly cleans AI response to ensure valid JSON.
-    """
+# --- HELPER FUNCTIONS ---
+
+def clean_json_response(text):
+    """Cleans AI output to ensure valid JSON"""
     try:
-        # 1. Remove Markdown code blocks
-        text = re.sub(r"```json\s*", "", raw_text)
+        text = re.sub(r"```json\s*", "", text)
         text = re.sub(r"```", "", text)
-        text = text.strip()
-        
-        # 2. Try parse
-        return json.loads(text)
-    except json.JSONDecodeError:
-        # 3. If fail, return empty list and log error
-        st.session_state["last_plan_debug"] = f"JSON PARSE ERROR:\n{raw_text}"
+        return json.loads(text.strip())
+    except:
         return []
 
-# --- API FUNCTIONS ---
-
 def get_session():
+    """Connects to Capital.com"""
     headers = {"X-CAP-API-KEY": CAP_API_KEY, "Content-Type": "application/json"}
     data = {"identifier": CAP_EMAIL, "password": CAP_PASSWORD}
     try:
         resp = requests.post(SESSION_URL, json=data, headers=headers)
         if resp.status_code == 200:
+            st.session_state["connection_status"] = "Connected ✅"
             return {
                 "CST": resp.headers["CST"],
                 "X-SECURITY-TOKEN": resp.headers["X-SECURITY-TOKEN"],
                 "X-CAP-API-KEY": CAP_API_KEY,
                 "Content-Type": "application/json"
             }
-    except: pass
+    except Exception as e:
+        st.session_state["connection_status"] = f"Error: {str(e)}"
     return None
 
-def get_account_safe(headers):
+def get_account_data(headers):
+    """Fetches Account Info (Equity, Funds)"""
     try:
         resp = requests.get(ACCOUNTS_URL, headers=headers)
-        if resp.status_code == 200: return resp.json()['accounts'][0]['balance']
-        elif resp.status_code == 401: return "UNAUTHORIZED"
+        if resp.status_code == 200:
+            data = resp.json()
+            if 'accounts' in data:
+                return data['accounts'][0]['balance']
+        elif resp.status_code == 401:
+            return "UNAUTHORIZED"
     except: pass
     return None
 
-def get_positions(headers):
+def get_open_positions(headers):
+    """Fetches Open Trades"""
     try:
         resp = requests.get(POSITIONS_URL, headers=headers)
-        if resp.status_code == 200: return resp.json().get('positions', [])
+        if resp.status_code == 200:
+            return resp.json().get('positions', [])
     except: pass
     return []
 
-def execute_trade(headers, epic, direction, size):
-    payload = {"epic": epic, "direction": direction, "size": size, "guaranteedStop": False, "trailingStop": False}
+def execute_order(headers, epic, direction, size):
+    """Executes a Trade on Capital.com"""
+    payload = {
+        "epic": epic,
+        "direction": direction,
+        "size": size,
+        "guaranteedStop": False,
+        "trailingStop": False
+    }
     return requests.post(POSITIONS_URL, json=payload, headers=headers)
 
-def close_position(headers, deal_id):
-    return requests.delete(f"{POSITIONS_URL}/{deal_id}", headers=headers)
-
-def fetch_market_batch(headers, assets):
-    batch_data = []
+def fetch_market_prices(headers, assets):
+    """Fetches Live Prices for a list of assets"""
+    data_list = []
     for asset in assets:
         try:
-            resp = requests.get(f"{MARKETS_URL}/{asset}", headers=headers)
-            if resp.status_code == 200:
-                data = resp.json()
-                if 'snapshot' in data:
-                    s = data['snapshot']
-                    batch_data.append({
+            r = requests.get(f"{MARKETS_URL}/{asset}", headers=headers)
+            if r.status_code == 200:
+                d = r.json()
+                if 'snapshot' in d:
+                    data_list.append({
                         "symbol": asset,
-                        "price": s.get('offer', 0),
-                        "change": s.get('dailyChange', 0)
+                        "price": d['snapshot']['offer'],
+                        "change": d['snapshot']['dailyChange']
                     })
         except: pass
-    return batch_data
+    return data_list
 
-# --- AI LOGIC ---
+# --- AI FUNCTIONS ---
 
-def ai_smart_allocate(total_funds, market_data):
-    # Simplified data for AI context
+def ai_design_portfolio(invest_amount, market_data):
+    """
+    Step 1: AI decides WHAT to buy and HOW MUCH.
+    """
     data_str = json.dumps(market_data, indent=2)
-    
     prompt = f"""
-    You are a Portfolio Manager. 
-    Funds: ${total_funds}.
-    Market Data: {data_str}
+    You are a Portfolio Manager. I have ${invest_amount} USD.
+    Live Market Data: {data_str}
     
     TASK:
-    1. Identify the 3 best assets based on momentum.
-    2. Create a diversified allocation plan.
-    3. Return strictly valid JSON.
+    1. Select the Top 3-5 assets with best momentum.
+    2. Allocate the ${invest_amount} across them.
+    3. Return valid JSON.
     
-    EXAMPLE RESPONSE:
+    RESPONSE FORMAT:
     [
-        {{"asset": "BTCUSD", "direction": "BUY", "usd_amount": 300, "reason": "High Volatility"}},
-        {{"asset": "GOLD", "direction": "SELL", "usd_amount": 200, "reason": "Dropping"}}
+        {{"asset": "BTCUSD", "direction": "BUY", "usd_amount": 300, "reason": "Bullish trend"}},
+        {{"asset": "GOLD", "direction": "SELL", "usd_amount": 200, "reason": "Bearish trend"}}
     ]
     """
     try:
-        response = model.generate_content(prompt)
-        # Store raw text for debugging if it fails
-        st.session_state["last_plan_debug"] = response.text 
-        return clean_and_parse_json(response.text)
-    except Exception as e:
-        st.session_state["last_plan_debug"] = str(e)
-        return []
+        resp = model.generate_content(prompt)
+        return clean_json_response(resp.text)
+    except: return []
 
-def analyze_portfolio_aggressive(market_data_list):
-    data_str = json.dumps(market_data_list, indent=2)
+def ai_scalper_decision(market_data):
+    """
+    Auto-Trading logic for background loop.
+    """
+    data_str = json.dumps(market_data, indent=2)
     prompt = f"""
-    Role: High-Frequency Scalper.
+    Role: Aggressive Scalper.
     Data: {data_str}
-    Task: Pick 3 trades. Ignore safety.
+    Task: Pick 3 trades. Ignore safety. If trend exists, trade it.
     Return JSON: [{{"asset": "BTCUSD", "action": "BUY", "confidence": 90, "reason": "Pump"}}, ...]
     """
     try:
-        response = model.generate_content(prompt)
-        return clean_and_parse_json(response.text)
+        resp = model.generate_content(prompt)
+        return clean_json_response(resp.text)
     except: return []
 
-def manage_positions_ai(positions_data):
-    if not positions_data: return []
-    
-    # Safe summary builder
-    summary = []
-    for p in positions_data:
-        summary.append({
-            "id": p.get('dealId'), 
-            "asset": p.get('epic'), 
-            "pnl": p.get('profitAndLoss')
-        })
+# --- MAIN UI ---
 
-    data_str = json.dumps(summary, indent=2)
-    prompt = f"""
-    Risk Manager. 
-    Positions: {data_str}.
-    
-    Rules:
-    - CLOSE if PnL > 1.0 (Take Profit).
-    - CLOSE if PnL < -5.0 (Stop Loss).
-    - Otherwise HOLD.
-    
-    Return JSON: [{{"id": "123", "action": "CLOSE", "reason": "TP"}}, ...]
-    """
-    try:
-        response = model.generate_content(prompt)
-        return clean_and_parse_json(response.text)
-    except: return []
+st.title("🤖 Capital.com AI Trader")
 
-# --- UI LAYOUT ---
+# 1. AUTHENTICATION & CONNECTION
+# ---------------------------------------------------------
+if "headers" not in st.session_state or not st.session_state["headers"]:
+    st.session_state["headers"] = get_session()
 
-st.title(f"🏗️ AI Portfolio Architect")
-
-# Headers Init
 headers = st.session_state["headers"]
-if not headers:
-    headers = get_session()
-    st.session_state["headers"] = headers
+account_data = None
+positions_data = []
 
-# --- SIDEBAR ---
+# If connected, fetch data
+if headers:
+    account_data = get_account_data(headers)
+    
+    # Auto-Reconnect if token expired
+    if account_data == "UNAUTHORIZED":
+        st.toast("⚠️ Session expired. Reconnecting...", icon="🔄")
+        st.session_state["headers"] = get_session()
+        headers = st.session_state["headers"]
+        account_data = get_account_data(headers)
+
+    if account_data:
+        positions_data = get_open_positions(headers)
+
+# 2. DASHBOARD DISPLAY
+# ---------------------------------------------------------
+if account_data:
+    st.markdown(f"**Status:** {st.session_state['connection_status']}")
+    
+    # Metrics
+    equity = account_data.get('equity', 0)
+    avail = account_data.get('available', 0)
+    pnl = account_data.get('profitLoss', 0)
+    
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Equity", f"${equity:,.2f}")
+    col2.metric("Available Funds", f"${avail:,.2f}")
+    col3.metric("Total P&L", f"${pnl:,.2f}", delta=pnl)
+    col4.metric("Open Trades", len(positions_data))
+    
+    st.divider()
+    
+    # 3. OPEN POSITIONS TABLE (Fail-Safe)
+    st.subheader("⚔️ Active Positions")
+    if positions_data:
+        # Build safe list to prevent KeyError
+        clean_pos = []
+        for p in positions_data:
+            clean_pos.append({
+                "Asset": p.get('epic', 'Unknown'),
+                "Direction": p.get('direction', '-'),
+                "Size": p.get('dealSize', 0),
+                "Entry": p.get('openPrice', 0),
+                "P&L": p.get('profitAndLoss', 0)
+            })
+        st.dataframe(pd.DataFrame(clean_pos), use_container_width=True)
+    else:
+        st.info("No active trades found.")
+
+else:
+    st.warning("⚠️ Not Connected to Capital.com. Check logs or credentials.")
+
+# 4. SIDEBAR CONTROLS
+# ---------------------------------------------------------
 with st.sidebar:
-    st.header("🧠 Smart Allocate")
-    with st.form("smart_alloc_form"):
-        invest_amount = st.number_input("Invest Amount ($)", 100, 10000, 1000)
-        alloc_btn = st.form_submit_button("🚀 Build Portfolio")
+    st.header("🎮 Portfolio Builder")
+    st.caption("Step 1: AI Plans. Step 2: API Executes.")
+    
+    with st.form("portfolio_form"):
+        amount = st.number_input("Invest Amount ($)", 100, 10000, 1000)
+        build_btn = st.form_submit_button("🚀 Build & Execute")
         
-        if alloc_btn and headers:
-            st.info("Scanning...")
+        if build_btn and headers:
+            st.info("1. Scanning Market Prices...")
+            # Fetch Batch Data for Context
             batch = random.sample(PORTFOLIO, 10)
-            mkt_data = fetch_market_batch(headers, batch)
+            mkt_data = fetch_market_prices(headers, batch)
             
             if mkt_data:
-                plan = ai_smart_allocate(invest_amount, mkt_data)
+                st.info("2. Asking AI to Design Portfolio...")
+                plan = ai_design_portfolio(amount, mkt_data)
                 
                 if plan:
-                    st.success(f"Executing {len(plan)} trades!")
+                    st.success(f"AI Designed Plan with {len(plan)} trades!")
+                    st.write(plan) # Show plan to user
+                    
+                    st.info("3. Executing Orders via Capital.com API...")
                     for item in plan:
                         asset = item.get('asset')
                         direction = item.get('direction')
-                        usd = item.get('usd_amount')
                         
-                        # Dynamic Sizing (Approximate)
-                        size = 0.02 if "BTC" in asset else 1.0
+                        # Simple Sizing Logic (Safe for Demo)
+                        size = 0.01 if "BTC" in asset or "ETH" in asset else 1.0
                         
-                        res = execute_trade(headers, asset, direction, size)
+                        res = execute_order(headers, asset, direction, size)
+                        
                         if res.status_code == 200:
-                            st.toast(f"✅ Bought ${usd} of {asset}")
+                            st.toast(f"✅ Executed: {direction} {asset}")
                         else:
-                            st.error(f"Failed {asset}: {res.text}")
-                        time.sleep(0.3)
-                    time.sleep(1)
+                            st.error(f"❌ Failed {asset}: {res.text}")
+                        time.sleep(0.5)
+                    
+                    st.success("Portfolio Execution Complete!")
+                    time.sleep(2)
                     st.rerun()
                 else:
-                    st.error("AI returned invalid plan.")
-                    with st.expander("See Raw AI Error"):
-                        st.code(st.session_state["last_plan_debug"])
+                    st.error("AI returned an empty plan.")
             else:
-                st.error("Could not fetch market data.")
+                st.error("Failed to fetch market data.")
 
     st.divider()
-    st.header("🤖 Auto-Scalper")
-    run_bot = st.toggle("ACTIVATE SCALPER", key="run_bot")
-    if st.button("Reconnect"):
-        st.session_state["headers"] = get_session()
-        st.rerun()
-
-# --- MAIN DASHBOARD ---
-if headers:
-    acct = get_account_safe(headers)
     
-    # Auto-Reauth
-    if acct == "UNAUTHORIZED":
+    st.header("🤖 Auto-Scalper")
+    run_bot = st.toggle("Activate Background Bot", key="bot_active")
+    
+    if st.button("Force Reconnect"):
         st.session_state["headers"] = get_session()
         st.rerun()
 
-    if acct:
-        # 1. METRICS
-        equity = acct.get('equity', 0)
-        avail = acct.get('available', 0)
-        pnl = acct.get('profitLoss', 0)
-        positions = get_positions(headers)
-
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Equity", f"${equity:,.0f}")
-        m2.metric("Available", f"${avail:,.0f}")
-        m3.metric("P&L", f"${pnl:,.2f}", delta=pnl)
-        m4.metric("Open Trades", len(positions))
+# 5. BACKGROUND AUTO-TRADING LOOP
+# ---------------------------------------------------------
+if run_bot and headers:
+    status_box = st.empty()
+    
+    # Scan a batch of assets
+    batch = random.sample(PORTFOLIO, 8)
+    
+    with status_box.status(f"⚡ Bot Scanning {len(batch)} Assets...", expanded=True) as status:
+        mkt_data = fetch_market_prices(headers, batch)
         
-        st.divider()
-
-        # 2. ACTIVE POSITIONS (MANUAL BUILD - NO CRASH)
-        st.subheader("⚔️ Active Positions")
-        if positions:
-            # We build the list manually to ensure keys exist
-            clean_positions = []
-            for p in positions:
-                clean_positions.append({
-                    "Symbol": p.get('epic', 'Unknown'),
-                    "Direction": p.get('direction', '-'),
-                    "Size": p.get('dealSize', 0),
-                    "Entry": p.get('openPrice', 0),
-                    "P&L": p.get('profitAndLoss', 0)
-                })
+        if mkt_data:
+            decisions = ai_scalper_decision(mkt_data)
             
-            df = pd.DataFrame(clean_positions)
-            st.dataframe(
-                df, 
-                use_container_width=True,
-                column_config={
-                    "P&L": st.column_config.NumberColumn("P&L", format="$%.2f")
-                }
-            )
-        else:
-            st.info("No trades currently open.")
-
-        # 3. LOGS
-        with st.expander("📜 Live Action Log", expanded=True):
-            if st.session_state["log_history"]:
-                st.dataframe(pd.DataFrame(st.session_state["log_history"]), use_container_width=True, hide_index=True)
-            else:
-                st.caption("Log empty...")
-
-        # --- EXECUTION LOOP ---
-        if run_bot:
-            status_box = st.empty()
-            
-            # A. Manage Risk
-            if positions:
-                with status_box.status("🛡️ Managing Risk...", expanded=True) as status:
-                    decisions = manage_positions_ai(positions)
-                    if decisions:
-                        for dec in decisions:
-                            if dec.get('action') == "CLOSE":
-                                deal_id = dec.get('id')
-                                close_position(headers, deal_id)
-                                st.toast(f"💰 Closed Trade {deal_id}")
-                                st.session_state["log_history"].insert(0, {"Time": datetime.now().strftime("%H:%M:%S"), "Action": "CLOSE", "Reason": dec.get('reason')})
-                    status.write("Risk Check Complete.")
-
-            # B. Hunt Trades
-            batch = random.sample(PORTFOLIO, 10)
-            with status_box.status(f"⚡ Scalping 10 Assets...", expanded=True) as status:
-                market_data = fetch_market_batch(headers, batch)
-                if market_data:
-                    decisions = analyze_portfolio_aggressive(market_data)
-                    if decisions:
-                        status.write(f"AI found {len(decisions)} trades!")
-                        for dec in decisions:
-                            asset = dec.get('asset')
-                            action = dec.get('action')
-                            conf = dec.get('confidence', 0)
-                            
-                            if action in ["BUY", "SELL"] and conf > 40:
-                                if avail > 100:
-                                    size = 0.02 if "BTC" in asset else 1.0
-                                    execute_trade(headers, asset, action, size)
-                                    st.toast(f"💣 {action} {asset}")
-                                    st.session_state["log_history"].insert(0, {
-                                        "Time": datetime.now().strftime("%H:%M:%S"),
-                                        "Action": action,
-                                        "Asset": asset,
-                                        "Reason": dec.get('reason')
-                                    })
-                                    time.sleep(0.3)
+            if decisions:
+                status.write(f"AI found {len(decisions)} opportunities.")
+                for dec in decisions:
+                    asset = dec.get('asset')
+                    action = dec.get('action')
+                    conf = dec.get('confidence', 0)
                     
-                    if len(st.session_state["log_history"]) > 20: 
-                        st.session_state["log_history"] = st.session_state["log_history"][:20]
+                    if action in ["BUY", "SELL"] and conf > 50:
+                        # Execution
+                        size = 0.02 if "BTC" in asset else 1.0
+                        execute_order(headers, asset, action, size)
+                        
+                        # Logging
+                        msg = f"{action} {asset} (Conf: {conf}%)"
+                        st.toast(f"💣 {msg}")
+                        st.session_state["log_history"].insert(0, {
+                            "Time": datetime.now().strftime("%H:%M:%S"),
+                            "Log": msg
+                        })
+                        time.sleep(0.2)
+            else:
+                status.write("No trades found this cycle.")
+    
+    # Display Logs
+    if st.session_state["log_history"]:
+        with st.expander("📜 Activity Log", expanded=True):
+            st.dataframe(pd.DataFrame(st.session_state["log_history"]), use_container_width=True)
 
-            # C. Cooldown
-            for s in range(30, 0, -1):
-                status_box.info(f"🔥 reloading... {s}s")
-                time.sleep(1)
-            
-            st.rerun()
+    # Cooldown
+    time.sleep(10)
+    st.rerun()
