@@ -14,26 +14,29 @@ from Crypto.Cipher import PKCS1_v1_5
 # ==========================================
 class CapitalClient:
     def __init__(self):
-        # Load Secrets
+        # --- SECRETS MANAGEMENT ---
         try:
+            # Capital.com Credentials
             self.cap_key = st.secrets["capital_com"]["api_key"]
             self.login = st.secrets["capital_com"]["email"]
             self.password = st.secrets["capital_com"]["password"]
             
-            # Setup Gemini
+            # Google Gemini Credentials
             genai.configure(api_key=st.secrets["gemini"]["api_key"])
             self.model = genai.GenerativeModel('gemini-pro')
             
-        except Exception:
-            st.error("❌ Secrets missing! Add [capital_com] and [gemini] to secrets.toml")
+        except Exception as e:
+            st.error(f"❌ Secret Error: {e}")
+            st.info("Ensure .streamlit/secrets.toml has [capital_com] and [gemini] sections.")
             st.stop()
         
-        self.base_url = "https://demo-api-capital.backend-capital.com" # Change to LIVE for real money
+        # Base Configuration
+        self.base_url = "https://demo-api-capital.backend-capital.com" # Switch to LIVE url for real money
         self.session = requests.Session()
         self.cst = None
         self.x_security = None
 
-    # --- AUTHENTICATION ---
+    # --- ENCRYPTION & LOGIN ---
     def _encrypt_password(self, key_b64, timestamp):
         input_str = f"{self.password}|{timestamp}"
         input_bytes = base64.b64encode(input_str.encode('utf-8'))
@@ -45,15 +48,16 @@ class CapitalClient:
 
     def connect(self):
         try:
-            # 1. Get Key
+            # 1. Fetch Encryption Key
             r = self.session.get(f"{self.base_url}/api/v1/session/encryptionKey", headers={'X-CAP-API-KEY': self.cap_key})
             r.raise_for_status()
             data = r.json()
             
-            # 2. Encrypt & Login
+            # 2. Encrypt Password
             pw = self._encrypt_password(data['encryptionKey'], int(data['timeStamp']))
-            payload = {"identifier": self.login, "password": pw, "encryptedPassword": True}
             
+            # 3. Create Session
+            payload = {"identifier": self.login, "password": pw, "encryptedPassword": True}
             r = self.session.post(f"{self.base_url}/api/v1/session", json=payload, headers={'X-CAP-API-KEY': self.cap_key, 'Content-Type': 'application/json'})
             
             if r.status_code == 200:
@@ -62,63 +66,56 @@ class CapitalClient:
                 return True
             return False
         except Exception as e:
-            st.error(f"Login Error: {e}")
+            st.error(f"Login Failed: {e}")
             return False
 
-    # --- DATA FETCHING ---
+    # --- MARKET DATA ---
     def get_market_data(self, epic="ETHUSD"):
+        """Fetches Price, Account Status, Positions, and History in one go."""
         headers = {'X-CAP-API-KEY': self.cap_key, 'CST': self.cst, 'X-SECURITY-TOKEN': self.x_security}
         
-        # Get Price
         price = 0
+        account = {}
+        positions = []
+        candles = []
+
         try:
+            # Price
             r = self.session.get(f"{self.base_url}/api/v1/markets/{epic}", headers=headers)
             if r.status_code == 200: price = r.json()['snapshot']['offer']
-        except: pass
-
-        # Get Account
-        account = {}
-        try:
+            
+            # Account Info (Equity, Margin)
             r = self.session.get(f"{self.base_url}/api/v1/accounts", headers=headers)
             if r.status_code == 200: account = r.json()['accounts'][0]['balance']
-        except: pass
-        
-        # Get Positions
-        positions = []
-        try:
+            
+            # Active Positions
             r = self.session.get(f"{self.base_url}/api/v1/positions", headers=headers)
             if r.status_code == 200: positions = r.json()['positions']
-        except: pass
 
-        # Get Candles (History for AI)
-        candles = []
-        try:
+            # Candle History (For AI Context)
             r = self.session.get(f"{self.base_url}/api/v1/prices/{epic}?resolution=MINUTE&max=15", headers=headers)
             if r.status_code == 200: 
                 raw = r.json()['prices']
-                for c in raw:
-                    candles.append(c['closePrice']['bid'])
-        except: pass
+                for c in raw: candles.append(c['closePrice']['bid'])
+                
+        except Exception:
+            pass # Silent fail to keep loop running
 
         return price, account, positions, candles
 
     # --- TRADING ACTIONS ---
-    def place_order(self, epic, side, size, leverage=10):
-        # NOTE: Capital.com sets leverage on the ACCOUNT level per asset, usually not per API call.
-        # We calculate size based on the leverage we assume is active.
+    def place_order(self, epic, side, size):
         headers = {'X-CAP-API-KEY': self.cap_key, 'CST': self.cst, 'X-SECURITY-TOKEN': self.x_security, 'Content-Type': 'application/json'}
-        
         payload = {
             "epic": epic,
             "direction": side, # "BUY" or "SELL"
             "size": size
         }
         r = self.session.post(f"{self.base_url}/api/v1/positions", json=payload, headers=headers)
-        return r.status_code == 200, r.text
+        return r.status_code == 200
 
-    def close_all(self):
+    def close_all_positions(self):
         headers = {'X-CAP-API-KEY': self.cap_key, 'CST': self.cst, 'X-SECURITY-TOKEN': self.x_security}
-        # 1. Close Positions
         r = self.session.get(f"{self.base_url}/api/v1/positions", headers=headers)
         if r.status_code == 200:
             for p in r.json()['positions']:
@@ -128,217 +125,187 @@ class CapitalClient:
 # ==========================================
 # 2. AI STRATEGY ENGINE (Gemini)
 # ==========================================
-def ask_gemini_for_decision(bot, current_price, candles, equity, available):
-    """
-    Sends market data to Gemini and asks for a trading decision based on the 50/30/20 rule.
-    """
-    
-    # 1. Construct the Prompt
-    trend_str = " -> ".join([str(c) for c in candles[-10:]]) # Last 10 mins trend
+def ask_gemini_strategy(bot, price, candles, equity, available):
+    # Prepare Data Context for the LLM
+    trend_str = " -> ".join([str(c) for c in candles[-10:]])
     
     prompt = f"""
-    You are a professional Crypto Trading Agent. 
-    Current Asset: ETH/USD. Current Price: {current_price}.
-    Recent 10m Trend (Close Prices): {trend_str}
+    Act as a Hedge Fund Algo. Asset: ETH/USD. Price: {price}.
+    Recent 10m Trend: {trend_str}
     
-    My Portfolio Rules:
-    1. Total Equity: {equity:.2f}
-    2. Available Cash: {available:.2f}
-    3. Strategy: 
-       - 20% MUST remain cash (Safety Reserve).
-       - 50% Allocation for Strong Trends.
-       - 30% Allocation for Micro-Fluctuations (High Leverage).
+    Portfolio State:
+    - Equity: {equity}
+    - Available Cash: {available}
     
-    Task:
-    Analyze the trend. 
-    - If price is rising consistently, signal BUY.
-    - If price is falling consistently, signal SELL.
-    - If flat or available cash is near the 20% limit ({equity*0.2:.2f}), signal HOLD.
+    Rules:
+    1. Maintain 20% Cash Reserve. (Current Reserve Floor: {equity*0.2})
+    2. If Available Cash < Reserve Floor, signal HOLD (Defensive Mode).
+    3. If Trend is clearly UP, signal BUY.
+    4. If Trend is clearly DOWN, signal SELL (Short).
     
-    Output ONLY one word: BUY, SELL, or HOLD.
+    Output strictly one word: BUY, SELL, or HOLD.
     """
     
     try:
         response = bot.model.generate_content(prompt)
         decision = response.text.strip().upper()
-        # Sanitize output
         if "BUY" in decision: return "BUY"
         if "SELL" in decision: return "SELL"
         return "HOLD"
-    except Exception as e:
-        return "HOLD" # Safety default
+    except:
+        return "HOLD"
 
 # ==========================================
-# 3. STREAMLIT APP
+# 3. STREAMLIT FRONTEND
 # ==========================================
 def main():
-    st.set_page_config(page_title="Gemini AI Trader", page_icon="🤖", layout="wide")
+    st.set_page_config(page_title="AI Hedge Fund", page_icon="🏦", layout="wide")
     
-    # --- CSS for Professional Look ---
+    # Custom CSS for the Dashboard Header
     st.markdown("""
         <style>
-        .metric-box {
-            background-color: #0E1117;
-            border: 1px solid #262730;
-            padding: 15px;
-            border-radius: 5px;
-            text-align: center;
+        div[data-testid="metric-container"] {
+            background-color: #1E1E1E;
+            border: 1px solid #333;
+            padding: 10px;
+            border-radius: 8px;
         }
-        .big-font { font-size: 24px; font-weight: bold; }
-        .green { color: #00FF00; }
-        .red { color: #FF0000; }
         </style>
     """, unsafe_allow_html=True)
 
-    # --- STATE INIT ---
+    # Initialize State
     if 'bot' not in st.session_state:
         st.session_state.bot = CapitalClient()
         st.session_state.connected = False
         st.session_state.active = False
-        st.session_state.last_ai_check = datetime.now() - timedelta(minutes=5)
-        st.session_state.ai_decision = "WAITING"
+        st.session_state.last_ai_check = datetime.now() - timedelta(minutes=2) # Force check on start
+        st.session_state.ai_decision = "INITIALIZING"
         st.session_state.midnight_mode = False
 
     bot = st.session_state.bot
 
     # --- SIDEBAR ---
     with st.sidebar:
-        st.header("🤖 AI Controls")
+        st.title("🏦 Fund Controls")
+        
         if not st.session_state.connected:
-            if st.button("🔌 Connect APIs", type="primary"):
+            if st.button("🔌 Connect to Broker", type="primary"):
                 if bot.connect():
                     st.session_state.connected = True
                     st.rerun()
         else:
-            st.success("Systems Online")
+            st.success("API Uplink Established")
             
             st.divider()
-            st.subheader("Strategy Config")
-            leverage = st.number_input("Target Leverage", value=10)
+            st.subheader("Allocation Strategy")
+            leverage = st.number_input("Leverage (1:X)", value=10)
             base_invest = st.number_input("Base Trade Size ($)", value=100)
             
             st.divider()
             col1, col2 = st.columns(2)
             if st.session_state.active:
-                if col1.button("🛑 STOP"):
+                if col1.button("🛑 PAUSE"):
                     st.session_state.active = False
                     st.rerun()
             else:
-                if col1.button("▶️ START"):
+                if col1.button("▶️ RUN AI"):
                     st.session_state.active = True
                     st.rerun()
             
             if col2.button("⚠️ CLOSE ALL"):
-                bot.close_all()
-                st.toast("Panic Close Triggered!")
+                bot.close_all_positions()
+                st.toast("Executed Emergency Close")
 
-    # --- MAIN UI ---
+    # --- MAIN DASHBOARD ---
     st.title("🤖 Gemini AI Hedge Fund Agent")
     
     if not st.session_state.connected:
-        st.info("Please connect via the sidebar to start the feed.")
+        st.info("Waiting for connection... (Check Sidebar)")
         st.stop()
 
-    # --- PLACEHOLDERS ---
-    # We use placeholders to update specific parts of the UI without full reloads
+    # Layout Placeholders
     header_ph = st.empty()
-    chart_ph = st.empty()
-    log_ph = st.empty()
+    status_ph = st.empty()
     table_ph = st.empty()
 
-    # --- MAIN LOOP ---
+    # --- MAIN EXECUTION LOOP ---
     while True:
-        # 1. Fetch Data (Real-time)
+        # 1. Fetch Live Data
         price, account, positions, candles = bot.get_market_data("ETHUSD")
         
-        # 2. Extract Metrics
+        # 2. Parse Metrics
         equity = account.get('equity', 0)
         available = account.get('available', 0)
-        margin_used = account.get('margin', 0)
+        margin = account.get('margin', 0)
         pl = account.get('profitLoss', 0)
         
-        # 3. Calculate 20% Reserve Logic
-        cash_reserve_limit = equity * 0.20
-        is_reserve_danger = available < cash_reserve_limit
-
-        # 4. Midnight Logic (Barcelona Time handling manually or just use System Time)
+        # 3. Strategy Checks
+        reserve_limit = equity * 0.20
+        is_safe_to_trade = available > reserve_limit
+        
+        # 4. Midnight Protocol (Close 1m before, Resume 5m after)
         now = datetime.now()
-        is_midnight = now.hour == 23 and now.minute == 59
-        
-        if is_midnight and not st.session_state.midnight_mode:
+        if now.hour == 23 and now.minute == 59 and not st.session_state.midnight_mode:
             st.session_state.midnight_mode = True
-            st.toast("🌙 Midnight Protocol: Closing Trades...", icon="🌑")
-            bot.close_all()
-            st.session_state.active = False # Pause execution
+            bot.close_all_positions()
+            st.toast("🌙 Midnight Protocol: Positions Cleared.")
         
-        if st.session_state.midnight_mode and now.hour == 0 and now.minute == 5:
+        if st.session_state.midnight_mode and now.hour == 0 and now.minute >= 5:
             st.session_state.midnight_mode = False
-            st.session_state.active = True
-            st.toast("☀️ Morning Protocol: Resuming Strategy", icon="🌅")
+            st.toast("☀️ Morning Protocol: Trading Resumed.")
 
-        # 5. AI Decision Loop (Every 1 Minute)
-        time_since_last = (now - st.session_state.last_ai_check).total_seconds()
+        # 5. AI Decision Cycle (Every 60s)
+        time_since_ai = (now - st.session_state.last_ai_check).total_seconds()
         
-        if st.session_state.active and not is_reserve_danger and time_since_last > 60:
-            # Ask Gemini
-            decision = ask_gemini_for_decision(bot, price, candles, equity, available)
-            st.session_state.ai_decision = decision
-            st.session_state.last_ai_check = now
-            
-            # Execute Decision
-            if decision == "BUY":
-                # Calc size: (Investment * Leverage) / Price
-                size = round((base_invest * leverage) / price, 2)
-                bot.place_order("ETHUSD", "BUY", size)
-                st.toast(f"🤖 AI Bought {size} ETH", icon="📈")
-            
-            elif decision == "SELL":
-                # For CFD, SELL means Short. If we just want to close, we'd use close logic.
-                # Here we assume aggressive 30% fluctuation capture -> Opening Short
-                size = round((base_invest * leverage) / price, 2)
-                bot.place_order("ETHUSD", "SELL", size)
-                st.toast(f"🤖 AI Shorted {size} ETH", icon="📉")
+        if st.session_state.active and not st.session_state.midnight_mode and time_since_ai > 60:
+            if is_safe_to_trade:
+                decision = ask_gemini_strategy(bot, price, candles, equity, available)
+                st.session_state.ai_decision = decision
+                st.session_state.last_ai_check = now
+                
+                # Execute
+                if decision in ["BUY", "SELL"]:
+                    size = round((base_invest * leverage) / price, 2)
+                    bot.place_order("ETHUSD", decision, size)
+                    st.toast(f"🤖 AI Executed: {decision} {size} ETH")
+            else:
+                st.session_state.ai_decision = "HOLD (Cash Reserve Low)"
 
-        # --- UI UPDATES ---
+        # --- UI RENDER ---
         
-        # A. Header Metrics
+        # A. Header (Real-Time)
         with header_ph.container():
             c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Equity (Total)", f"€{equity:,.2f}")
-            
-            # Color Available Funds Red if near 20% limit
-            avail_color = "inverse" if is_reserve_danger else "normal"
-            c2.metric("Available (Free)", f"€{available:,.2f}", delta=f"Reserve Limit: €{cash_reserve_limit:.0f}", delta_color=avail_color)
-            
-            c3.metric("Used Margin (Active)", f"€{margin_used:,.2f}")
+            c1.metric("Total Equity", f"€{equity:,.2f}")
+            c2.metric("Available Funds", f"€{available:,.2f}", delta=f"Reserve: €{reserve_limit:.0f}")
+            c3.metric("Margin Used", f"€{margin:,.2f}")
             c4.metric("Total P/L", f"€{pl:,.2f}", delta=pl)
 
-        # B. Status & Log
-        with log_ph.container():
-            s1, s2 = st.columns([1, 3])
-            status_text = "RUNNING" if st.session_state.active else "PAUSED"
-            if st.session_state.midnight_mode: status_text = "MIDNIGHT RESET"
+        # B. Status Bar
+        with status_ph.container():
+            s1, s2 = st.columns([1, 4])
+            state_label = "ACTIVE" if st.session_state.active else "IDLE"
+            if st.session_state.midnight_mode: state_label = "SLEEPING"
             
-            s1.info(f"**Bot Status:** {status_text}")
-            s2.success(f"🤖 **Gemini Analysis:** {st.session_state.ai_decision} | Last Check: {st.session_state.last_ai_check.strftime('%H:%M:%S')}")
+            s1.info(f"**State:** {state_label}")
+            s2.success(f"🧠 **AI Strategy:** {st.session_state.ai_decision} (Last Update: {st.session_state.last_ai_check.strftime('%H:%M:%S')})")
 
-        # C. Active Trade Table
-        trade_data = []
+        # C. Active Trades Table
+        trade_list = []
         for p in positions:
-            trade_data.append({
+            trade_list.append({
                 "Asset": p.get('epic'),
                 "Side": p.get('direction'),
                 "Size": p.get('size'),
-                "Entry": p.get('openPrice'),
-                "Live P/L": f"€{p.get('profitAndLoss'):.2f}"
+                "Entry Price": p.get('openPrice'),
+                "Current P/L": f"€{p.get('profitAndLoss'):.2f}"
             })
         
-        if trade_data:
-            table_ph.dataframe(pd.DataFrame(trade_data), use_container_width=True)
+        if trade_list:
+            table_ph.dataframe(pd.DataFrame(trade_list), use_container_width=True)
         else:
             table_ph.caption("No Active Positions")
 
-        # Refresh Rate
         time.sleep(1)
 
 if __name__ == "__main__":
