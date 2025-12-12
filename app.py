@@ -1,338 +1,352 @@
+"""
+Aggressive micro-trading Streamlit app skeleton for Capital.com
+- Reads credentials from st.secrets (or environment variables)
+- Demonstration "aggressive micro" strategy that can run either in LIVE mode (calls Capital.com API)
+  or SIMULATION mode (no real trades).
+- Uses up to 80% of available funds per user request.
+- WARNING: This is example code. Test on a demo account only.
+"""
+
 import streamlit as st
 import requests
-import base64
 import time
+import threading
 import pandas as pd
-import google.generativeai as genai
-from datetime import datetime, timedelta
-from Crypto.PublicKey import RSA
-from Crypto.Cipher import PKCS1_v1_5
+import numpy as np
+import os
+from dotenv import load_dotenv
 
-# ==========================================
-# 1. CAPITAL.COM API CLIENT
-# ==========================================
-class CapitalClient:
-    def __init__(self):
-        try:
-            self.cap_key = st.secrets["capital_com"]["api_key"]
-            self.login = st.secrets["capital_com"]["email"]
-            self.password = st.secrets["capital_com"]["password"]
-            
-            genai.configure(api_key=st.secrets["gemini"]["GEMINI_API_KEY"])
-            
-            # FORCE 2.5 FLASH LITE
-            try:
-                self.model_name = "gemini-2.5-flash-lite"
-                self.model = genai.GenerativeModel(self.model_name)
-            except:
-                self.model_name = "gemini-2.0-flash-lite-preview-02-05"
-                self.model = genai.GenerativeModel(self.model_name)
-            
-        except Exception as e:
-            st.error(f"❌ Init Error: {e}")
-            st.stop()
-        
-        self.base_url = "https://demo-api-capital.backend-capital.com"
-        self.session = requests.Session()
-        self.cst = None
-        self.x_security = None
+load_dotenv()
 
-    def _encrypt_password(self, key_b64, timestamp):
-        input_str = f"{self.password}|{timestamp}"
-        input_bytes = base64.b64encode(input_str.encode('utf-8'))
-        key_bytes = base64.b64decode(key_b64)
-        public_key = RSA.import_key(key_bytes)
-        cipher = PKCS1_v1_5.new(public_key)
-        encrypted = cipher.encrypt(input_bytes)
-        return base64.b64encode(encrypted).decode('utf-8')
+st.set_page_config(layout="wide", page_title="MicroTrader (demo)")
 
-    def connect(self):
-        try:
-            r = self.session.get(f"{self.base_url}/api/v1/session/encryptionKey", headers={'X-CAP-API-KEY': self.cap_key})
-            if r.status_code != 200:
-                st.sidebar.error(f"Key Error: {r.status_code}")
-                return False
-                
-            data = r.json()
-            pw = self._encrypt_password(data['encryptionKey'], int(data['timeStamp']))
-            
-            payload = {"identifier": self.login, "password": pw, "encryptedPassword": True}
-            r = self.session.post(f"{self.base_url}/api/v1/session", json=payload, headers={'X-CAP-API-KEY': self.cap_key, 'Content-Type': 'application/json'})
-            
-            if r.status_code == 200:
-                self.cst = r.headers.get('CST')
-                self.x_security = r.headers.get('X-SECURITY-TOKEN')
-                return True
-            else:
-                st.sidebar.error(f"Session Error: {r.text}")
-                return False
-        except Exception as e:
-            st.sidebar.error(f"Conn Exception: {e}")
-            return False
+# ---------- Config ----------
+MODE = st.sidebar.selectbox("Mode", ["SIMULATION", "LIVE"])
+USE_SIMULATION = (MODE == "SIMULATION")
+MAX_RISK_FRACTION = st.sidebar.slider("Max capital usage fraction", 0.1, 0.95, 0.8, 0.05)  # default 0.8
+INSTRUMENT = st.sidebar.text_input("Instrument (symbol)", "BTCUSD")
+TICK_INTERVAL = st.sidebar.number_input("Poll interval (seconds)", 1.0, 60.0, 2.0, 1.0)
 
-    # --- DEBUGGED DATA FETCHING ---
-    def get_market_data(self, epic="ETHUSD"):
-        headers = {'X-CAP-API-KEY': self.cap_key, 'CST': self.cst, 'X-SECURITY-TOKEN': self.x_security}
-        
-        price = 0
-        account = {}
-        positions = []
-        candles = []
-
-        # 1. POSITIONS (Check for failures)
-        try:
-            r = self.session.get(f"{self.base_url}/api/v1/positions", headers=headers)
-            if r.status_code == 200:
-                positions = r.json().get('positions', [])
-            elif r.status_code == 401:
-                self.connect() # Re-login if expired
-        except Exception as e:
-            st.sidebar.warning(f"Pos Fetch Fail: {e}")
-
-        # 2. ACCOUNTS (Check for failures)
-        try:
-            r = self.session.get(f"{self.base_url}/api/v1/accounts", headers=headers)
-            if r.status_code == 200:
-                # Capital.com returns a list of accounts. We grab the first one.
-                acc_list = r.json().get('accounts', [])
-                if acc_list:
-                    account = acc_list[0].get('balance', {})
-            else:
-                st.sidebar.warning(f"Acc Fetch Fail: {r.status_code}")
-        except: pass
-
-        # 3. PRICE
-        try:
-            r = self.session.get(f"{self.base_url}/api/v1/markets/{epic}", headers=headers)
-            if r.status_code == 200:
-                price = r.json()['snapshot']['offer']
-        except: pass
-
-        # 4. HISTORY
-        try:
-            r = self.session.get(f"{self.base_url}/api/v1/prices/{epic}?resolution=MINUTE&max=5", headers=headers)
-            if r.status_code == 200: 
-                raw = r.json()['prices']
-                for c in raw: candles.append(c['closePrice']['bid'])
-        except: pass
-
-        return price, account, positions, candles
-
-    def place_order(self, epic, side, size):
-        headers = {'X-CAP-API-KEY': self.cap_key, 'CST': self.cst, 'X-SECURITY-TOKEN': self.x_security, 'Content-Type': 'application/json'}
-        payload = {"epic": epic, "direction": side, "size": size}
-        r = self.session.post(f"{self.base_url}/api/v1/positions", json=payload, headers=headers)
-        return r.status_code == 200, r.text
-
-    def close_all_positions(self):
-        headers = {'X-CAP-API-KEY': self.cap_key, 'CST': self.cst, 'X-SECURITY-TOKEN': self.x_security}
-        r = self.session.get(f"{self.base_url}/api/v1/positions", headers=headers)
-        if r.status_code == 200:
-            for p in r.json()['positions']:
-                self.session.delete(f"{self.base_url}/api/v1/positions/{p['dealId']}", headers=headers)
-
-# ==========================================
-# 2. MANIC AI MANAGER
-# ==========================================
-def ask_gemini_aggressive(bot, price, candles):
-    if not candles: return "MICRO BUY", "No Data - Force Entry"
-
-    trend_str = " -> ".join([str(c) for c in candles[-5:]]) 
-    
-    prompt = f"""
-    You are a High-Frequency Crypto Trading Bot.
-    Asset: ETH/USD. Price: {price}.
-    Recent 5m Trend: {trend_str}
-    
-    YOUR JOB IS TO TRADE. HOLDING IS FORBIDDEN.
-    
-    Rules:
-    1. If price is moving UP even slightly -> CORE BUY
-    2. If price is moving DOWN even slightly -> CORE SELL
-    3. If flat -> Scalp the noise (MICRO BUY/SELL)
-    
-    You MUST output strictly: "DECISION | REASON"
-    Valid Decisions: CORE BUY, CORE SELL, MICRO BUY, MICRO SELL
-    """
-    
+# Read secrets (recommended: set these via Streamlit Secrets or environment variables)
+def get_secret(section, key, fallback=None):
+    # Try streamlit secrets
     try:
-        response = bot.model.generate_content(prompt)
-        text = response.text.strip()
-        if "|" in text:
-            decision, reason = text.split("|", 1)
-            return decision.strip().upper(), reason.strip()
-        return "MICRO BUY", "AI Format Error - Defaulting to Buy"
-    except Exception as e:
-        return "MICRO BUY", f"API Fail - Force Buy: {str(e)[:10]}"
+        return st.secrets[section][key]
+    except Exception:
+        # try env var
+        return os.getenv(f"{section.upper()}_{key.upper()}", fallback)
 
-# ==========================================
-# 3. DYNAMIC SIZING
-# ==========================================
-def calculate_trade_size(decision, equity, price):
-    if price == 0 or equity == 0: return 0.01 
-    
-    core_fund = equity * 0.50
-    micro_fund = equity * 0.30
-    
-    size = 0.0
-    
-    if "CORE" in decision:
-        invest = core_fund * 0.10
-        leverage = 5
-        size = (invest * leverage) / price
-        
-    elif "MICRO" in decision:
-        invest = micro_fund * 0.15
-        leverage = 10 
-        size = (invest * leverage) / price
-        
-    return round(size, 2)
+# Capital.com secrets expected to live in st.secrets["capital_com"]
+CAP_API_KEY = get_secret("capital_com", "api_key")
+CAP_EMAIL = get_secret("capital_com", "email")
+CAP_PASSWORD = get_secret("capital_com", "password")
 
-# ==========================================
-# 4. MAIN LOOP
-# ==========================================
-def main():
-    st.set_page_config(page_title="AI Scalper", page_icon="⚡", layout="wide")
-    
-    st.markdown("""
-        <style>
-        div[data-testid="metric-container"] {
-            background-color: #111;
-            border: 1px solid #444;
-            padding: 10px;
-            border-radius: 5px;
+# Safety check: do not run live if no credentials
+if MODE == "LIVE" and not (CAP_API_KEY and CAP_EMAIL and CAP_PASSWORD):
+    st.error("LIVE mode requires Capital.com credentials in st.secrets or environment variables.")
+    st.stop()
+
+# ---------- Simple API helper for Capital.com ----------
+class CapitalClient:
+    BASE = "https://api-capital.backend-capital.com"  # placeholder base; adjust if your region differs
+    def __init__(self, api_key, email=None, password=None):
+        self.api_key = api_key
+        self.email = email
+        self.password = password
+        self.headers = {"X-CAP-API-KEY": self.api_key, "Content-Type": "application/json"}
+        self.cst = None
+        self.xsecurity = None
+
+    def login(self):
+        """
+        Login to Capital.com to obtain CST and X-SECURITY-TOKEN headers.
+        The official flow uses POST /session (and possible encryption step). See docs.
+        """
+        url = f"{self.BASE}/session"
+        payload = {
+            "identifier": self.email,
+            "password": self.password,
+            "encryptedPassword": False
         }
-        </style>
-    """, unsafe_allow_html=True)
-
-    if 'bot' not in st.session_state:
-        st.session_state.bot = CapitalClient()
-        st.session_state.connected = False
-        st.session_state.active = False
-        # Force immediate start
-        st.session_state.last_ai_check = datetime.now() - timedelta(minutes=1) 
-        st.session_state.ai_log = []
-        st.session_state.cooldown_until = None
-
-    bot = st.session_state.bot
-
-    with st.sidebar:
-        st.title("⚡ Scalper Admin")
-        st.caption(f"🧠 Brain: {bot.model_name}")
-        
-        if not st.session_state.connected:
-            if st.button("🔌 Connect", type="primary"):
-                if bot.connect():
-                    st.session_state.connected = True
-                    st.rerun()
-        else:
-            st.success("Connected")
-            
-            c1, c2 = st.columns(2)
-            if st.session_state.active:
-                if c1.button("🛑 STOP"):
-                    st.session_state.active = False
-                    st.rerun()
+        r = requests.post(url, json=payload, headers=self.headers)
+        if r.status_code in (200, 201):
+            # Capital.com returns CST and X-SECURITY-TOKEN in response headers
+            self.cst = r.headers.get("CST")
+            self.xsecurity = r.headers.get("X-SECURITY-TOKEN")
+            if self.cst and self.xsecurity:
+                self.headers["CST"] = self.cst
+                self.headers["X-SECURITY-TOKEN"] = self.xsecurity
+                return True, r.json()
             else:
-                if c1.button("▶️ START NOW"):
-                    st.session_state.active = True
-                    st.session_state.last_ai_check = datetime.now() - timedelta(minutes=1)
-                    st.rerun()
-            
-            if c2.button("⚠️ CLOSE ALL"):
-                bot.close_all_positions()
-                st.toast("Dumped positions.")
-
-    st.title("🤖 AI High-Frequency Scalper")
-    
-    if not st.session_state.connected:
-        st.info("👈 Connect via Sidebar")
-        st.stop()
-
-    header_ph = st.empty()
-    
-    col_left, col_right = st.columns([2, 1])
-    with col_left:
-        st.subheader("📡 Live Positions")
-        table_ph = st.empty()
-    with col_right:
-        st.subheader("🧠 Neural Feed")
-        log_ph = st.empty()
-
-    while True:
-        # 1. DATA REFRESH
-        price, account, positions, candles = bot.get_market_data("ETHUSD")
-        
-        # 2. METRICS EXTRACTION (Fail-safe defaults)
-        equity = account.get('equity', 0)
-        available = account.get('available', 0)
-        margin = account.get('margin', 0)
-        pl = account.get('profitLoss', 0)
-        
-        # 3. SAFETY CHECK (20% Reserve, but allow trading if above)
-        safe_to_trade = available > (equity * 0.20)
-        
-        now = datetime.now()
-        in_cooldown = st.session_state.cooldown_until and now < st.session_state.cooldown_until
-        time_since = (now - st.session_state.last_ai_check).total_seconds()
-        
-        if st.session_state.active and not in_cooldown:
-            if time_since > 10:
-                if safe_to_trade:
-                    # REMOVED MAX POSITION LIMIT - UNLIMITED TRADING
-                    decision, reason = ask_gemini_aggressive(bot, price, candles)
-                    
-                    if "429" in reason:
-                        st.session_state.cooldown_until = now + timedelta(seconds=60)
-                        st.toast("⚠️ Rate Limit - Cooling 60s")
-                    else:
-                        timestamp = now.strftime('%H:%M:%S')
-                        log_entry = f"[{timestamp}] {decision}: {reason}"
-                        st.session_state.ai_log.insert(0, log_entry)
-                        st.session_state.last_ai_check = now
-                        
-                        side = "BUY" if "BUY" in decision else "SELL"
-                        size = calculate_trade_size(decision, equity, price)
-                        
-                        if size > 0:
-                            success, msg = bot.place_order("ETHUSD", side, size)
-                            if success:
-                                st.toast(f"⚡ {decision} {size} ETH", icon="🔥")
-                            else:
-                                st.session_state.ai_log.insert(0, f"[{timestamp}] API REFUSED: {msg}")
-                else:
-                    st.error(f"LOW FUNDS: ${available} < Reserve")
-
-        # 4. UI UPDATE
-        with header_ph.container():
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Equity", f"€{equity:,.2f}")
-            c2.metric("Free Funds", f"€{available:,.2f}", delta=f"Safe: €{equity*0.2:.0f}")
-            c3.metric("Margin Used", f"€{margin:,.2f}")
-            c4.metric("Total P/L", f"€{pl:,.2f}", delta=pl)
-
-        # 5. TABLE UPDATE
-        if positions:
-            trade_list = []
-            for p in positions:
-                val_pl = p.get('profitAndLoss', 0)
-                if val_pl is None: val_pl = 0
-                
-                trade_list.append({
-                    "Type": p.get('direction'),
-                    "Size": p.get('size'),
-                    "Entry": p.get('openPrice'),
-                    "P/L": f"€{val_pl:.2f}"
-                })
-            table_ph.dataframe(pd.DataFrame(trade_list), use_container_width=True)
+                return False, {"error": "Login succeeded but CST/X-SECURITY-TOKEN missing. See docs."}
         else:
-            table_ph.info("Scanning for setup...")
+            return False, {"status_code": r.status_code, "text": r.text}
 
-        with log_ph.container(height=400):
-            for log in st.session_state.ai_log[:20]:
-                st.text(log)
+    def get_account_overview(self):
+        """
+        Example call to retrieve account/funds. Endpoint names may differ; check your API docs.
+        We'll try a commonly used endpoint "/clients" or "/tradingAccounts".
+        """
+        for endpoint in ["/clients", "/tradingAccounts", "/accounts"]:
+            try:
+                r = requests.get(self.BASE + endpoint, headers=self.headers, timeout=10)
+                if r.status_code == 200:
+                    return True, r.json()
+            except Exception:
+                pass
+        return False, {"error": "Could not fetch account overview; adjust endpoint according to docs."}
 
-        time.sleep(1)
+    def place_market_order(self, symbol, direction, size_units, stop_loss=None, take_profit=None):
+        """
+        Place an order.
+        This function is illustrative: adjust payload/endpoint to match Capital.com API.
+        """
+        payload = {
+            "epic": symbol,
+            "direction": "BUY" if direction == "long" else "SELL",
+            "size": size_units,          # may be notional or units depending on API
+            "orderType": "MARKET"
+        }
+        # attach SL/TP if supported
+        if stop_loss:
+            payload["stopLoss"] = stop_loss
+        if take_profit:
+            payload["takeProfit"] = take_profit
+        r = requests.post(self.BASE + "/orders", json=payload, headers=self.headers)
+        return r.status_code, r.text
 
-if __name__ == "__main__":
-    main()
+    def close_position(self, position_id):
+        r = requests.post(self.BASE + f"/positions/{position_id}/close", headers=self.headers)
+        return r.status_code, r.text
+
+    def get_prices(self, symbol):
+        # Example polling endpoint - adjust if necessary
+        r = requests.get(self.BASE + f"/prices/{symbol}", headers=self.headers, timeout=5)
+        if r.status_code == 200:
+            return True, r.json()
+        return False, {"status": r.status_code, "text": r.text}
+
+# ---------- Simulation utilities ----------
+class Simulator:
+    def __init__(self, starting_equity=10000.0):
+        self.equity = starting_equity
+        self.available = starting_equity
+        self.positions = {}  # id -> dict
+        self.trade_id_seq = 0
+        # simple synthetic price series
+        self.price = 50000.0 if "BTC" in INSTRUMENT else 100.0
+        np.random.seed(42)
+
+    def step_price(self):
+        # micro price changes with random noise
+        move = np.random.normal(loc=0.0, scale=self.price * 0.001)  # 0.1% noise
+        self.price = max(0.01, self.price + move)
+        return self.price
+
+    def open_position(self, direction, fraction_of_available):
+        notional = self.available * fraction_of_available
+        size_units = notional / self.price
+        self.trade_id_seq += 1
+        tid = f"sim-{self.trade_id_seq}"
+        self.positions[tid] = {
+            "direction": direction,
+            "units": size_units,
+            "open_price": self.price,
+            "notional": notional,
+            "current_pnl": 0.0
+        }
+        self.available -= notional
+        return tid
+
+    def update_positions(self):
+        for tid, pos in self.positions.items():
+            if pos["direction"] == "long":
+                pos["current_pnl"] = (self.price - pos["open_price"]) * pos["units"]
+            else:
+                pos["current_pnl"] = (pos["open_price"] - self.price) * pos["units"]
+        # update equity visible
+        total_pnl = sum(p["current_pnl"] for p in self.positions.values())
+        self.equity = self.available + sum(p["notional"] for p in self.positions.values()) + total_pnl
+
+    def close_position(self, tid):
+        pos = self.positions.pop(tid, None)
+        if not pos:
+            return 0.0
+        # realize PnL into available funds
+        realized = pos["notional"] + pos["current_pnl"]
+        self.available += realized
+        self.update_positions()
+        return realized
+
+# ---------- Strategy: aggressive micro strategy ----------
+class MicroTrader:
+    def __init__(self, client=None, sim=None, max_fraction=0.8):
+        self.client = client
+        self.sim = sim
+        self.max_fraction = max_fraction
+        self.open_trades = {}  # id -> info
+        self.log = []
+
+    def decide_and_trade(self, current_price):
+        """
+        Very simple micro-strategy:
+        - Look at short-term momentum across last N ticks
+        - If momentum > threshold -> open long using up to max_fraction of available funds
+        - If momentum < -threshold -> open short similarly
+        - Use tight TP/SL and close quickly
+        """
+        # For demo: random micro-decisions
+        momentum = np.random.normal(0, 1)
+        if momentum > 1.2:
+            # open long
+            if USE_SIMULATION:
+                tid = self.sim.open_position("long", self.max_fraction)
+                self.open_trades[tid] = {"direction": "long", "open_price": current_price}
+                self.log.append(f"SIM open long {tid} at {current_price:.2f}")
+            else:
+                # PLACE LIVE ORDER - adjust payload for real API
+                status, text = self.client.place_market_order(INSTRUMENT, "long", size_units=0.01,
+                                                              stop_loss=None, take_profit=None)
+                self.log.append(f"LIVE open long status {status}: {text}")
+        elif momentum < -1.2:
+            if USE_SIMULATION:
+                tid = self.sim.open_position("short", self.max_fraction)
+                self.open_trades[tid] = {"direction": "short", "open_price": current_price}
+                self.log.append(f"SIM open short {tid} at {current_price:.2f}")
+            else:
+                status, text = self.client.place_market_order(INSTRUMENT, "short", size_units=0.01)
+                self.log.append(f"LIVE open short status {status}: {text}")
+
+        # Aggressive closing: randomly close an open trade quickly
+        if self.open_trades and np.random.rand() < 0.5:
+            tid = next(iter(self.open_trades.keys()))
+            if USE_SIMULATION:
+                realized = self.sim.close_position(tid)
+                self.log.append(f"SIM closed {tid} realized {realized:.2f}")
+            else:
+                status, text = self.client.close_position(tid)
+                self.log.append(f"LIVE close {tid} status {status}: {text}")
+            self.open_trades.pop(tid, None)
+
+# ---------- App layout ----------
+st.title("MicroTrader — aggressive micro-trading skeleton")
+col1, col2, col3 = st.columns([2, 2, 3])
+
+with col1:
+    st.subheader("Equity / Margin / P&L")
+    equity_text = st.empty()
+    available_text = st.empty()
+    margin_text = st.empty()
+    total_pnl_text = st.empty()
+
+with col2:
+    st.subheader("AI log")
+    log_box = st.empty()
+
+with col3:
+    st.subheader("Open Trades")
+    trades_df_box = st.empty()
+
+# Instantiate client/sim/trader
+client = None
+sim = None
+if USE_SIMULATION:
+    sim = Simulator(starting_equity=10000.0)
+    trader = MicroTrader(client=None, sim=sim, max_fraction=MAX_RISK_FRACTION)
+else:
+    client = CapitalClient(CAP_API_KEY, CAP_EMAIL, CAP_PASSWORD)
+    ok, resp = client.login()
+    if not ok:
+        st.error(f"Failed to login: {resp}")
+        st.stop()
+    # get account overview for baseline
+    ok2, acct = client.get_account_overview()
+    if not ok2:
+        st.warning("Could not fetch account overview; continue but check endpoints/permissions.")
+    trader = MicroTrader(client=client, sim=None, max_fraction=MAX_RISK_FRACTION)
+
+# Background polling / trading loop
+stop_event = threading.Event()
+
+def run_loop():
+    while not stop_event.is_set():
+        try:
+            if USE_SIMULATION:
+                price = sim.step_price()
+                sim.update_positions()
+                equity = sim.equity
+                available = sim.available
+                total_pnl = equity - 10000.0
+            else:
+                okp, pdata = client.get_prices(INSTRUMENT)
+                if okp:
+                    # adapt to actual payload structure
+                    price = pdata.get("bid") if isinstance(pdata, dict) else None
+                    if price is None:
+                        # fallback: put a dummy price
+                        price = 1.0
+                else:
+                    price = 1.0
+
+                # fetch balances (best-effort)
+                okbal, bal = client.get_account_overview()
+                if okbal:
+                    # This is API-dependent: adapt to actual response shape
+                    equity = bal.get("equity", 0.0) if isinstance(bal, dict) else 0.0
+                    available = bal.get("available", 0.0) if isinstance(bal, dict) else 0.0
+                    total_pnl = bal.get("pl", 0.0) if isinstance(bal, dict) else 0.0
+                else:
+                    equity = 0.0
+                    available = 0.0
+                    total_pnl = 0.0
+
+            # strategy decision
+            trader.decide_and_trade(price)
+
+            # Update UI
+            equity_text.markdown(f"**Equity:** {equity:,.2f}")
+            available_text.markdown(f"**Available:** {available:,.2f}")
+            margin_text.markdown(f"**Max usage fraction:** {MAX_RISK_FRACTION:.2f}")
+            total_pnl_text.markdown(f"**Total P&L:** {total_pnl:,.2f}")
+
+            # trades table
+            if USE_SIMULATION:
+                trades = []
+                for tid, p in sim.positions.items():
+                    trades.append({
+                        "id": tid,
+                        "direction": p["direction"],
+                        "units": p["units"],
+                        "open_price": p["open_price"],
+                        "current_pnl": p["current_pnl"]
+                    })
+                df = pd.DataFrame(trades)
+            else:
+                # placeholder live-open-positions fetch (adjust to your API)
+                df = pd.DataFrame([{"id":"live-1","direction":"long","open_price":1.0,"current_pnl":0.0}])
+            trades_df_box.dataframe(df)
+
+            # logs
+            log_box.text("\n".join(trader.log[-20:]))
+
+        except Exception as e:
+            st.error(f"Error in loop: {e}")
+
+        time.sleep(TICK_INTERVAL)
+
+# Start / stop buttons
+if st.button("Start Trading"):
+    if "thread" not in st.session_state:
+        st.session_state.thread = threading.Thread(target=run_loop, daemon=True)
+        st.session_state.thread.start()
+        st.success("Trading loop started.")
+    else:
+        st.info("Trading loop already running.")
+
+if st.button("Stop Trading"):
+    stop_event.set()
+    st.session_state.pop("thread", None)
+    st.warning("Trading loop stopped.")
+
+st.caption("This is example/demo code. Adapt endpoints, payloads, and risk controls before any LIVE use.")
+
