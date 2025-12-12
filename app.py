@@ -21,9 +21,15 @@ class CapitalClient:
             # --- GEMINI SETUP ---
             genai.configure(api_key=st.secrets["gemini"]["GEMINI_API_KEY"])
             
-            # PRIORITY: Flash-8B (Highest Rate Limit) -> Flash-Lite -> Standard Flash
-            self.model_name = self._select_best_model()
-            self.model = genai.GenerativeModel(self.model_name)
+            # FORCE MODEL: 2.5 FLASH LITE
+            # We wrap in try/except to catch immediate instantiation errors
+            try:
+                self.model_name = "gemini-2.5-flash-lite"
+                self.model = genai.GenerativeModel(self.model_name)
+            except:
+                # If 2.5 fails, try 2.0 lite as backup
+                self.model_name = "gemini-2.0-flash-lite-preview-02-05"
+                self.model = genai.GenerativeModel(self.model_name)
             
         except Exception as e:
             st.error(f"❌ Connection Error: {e}")
@@ -33,24 +39,6 @@ class CapitalClient:
         self.session = requests.Session()
         self.cst = None
         self.x_security = None
-
-    def _select_best_model(self):
-        """Prioritizes High-Rate-Limit Models."""
-        try:
-            # 1. Try the specific high-rate-limit model first
-            # "gemini-1.5-flash" has 2x higher RPM limits than standard Flash
-            return "gemini-1.5-flash-8b" 
-        except:
-            # Fallbacks if 8B is not available to key
-            try:
-                available = [m.name for m in genai.list_models()]
-                if 'models/gemini-2.5-flash-lite-preview-02-05' in available:
-                    return 'gemini-2.5-flash-lite-preview-02-05'
-                if 'models/gemini-1.5-flash' in available:
-                    return 'gemini-1.5-flash'
-                return 'gemini-pro'
-            except:
-                return "gemini-1.5-flash"
 
     def _encrypt_password(self, key_b64, timestamp):
         input_str = f"{self.password}|{timestamp}"
@@ -119,7 +107,7 @@ class CapitalClient:
                 self.session.delete(f"{self.base_url}/api/v1/positions/{p['dealId']}", headers=headers)
 
 # ==========================================
-# 2. AI MANAGER
+# 2. AI MANAGER (2.5 FLASH LITE)
 # ==========================================
 def ask_gemini_aggressive(bot, price, candles):
     if not candles or len(candles) < 3:
@@ -208,7 +196,6 @@ def main():
 
     bot = st.session_state.bot
 
-    # --- SIDEBAR ---
     with st.sidebar:
         st.title("⚡ Scalper Admin")
         st.caption(f"🧠 Brain: {bot.model_name}")
@@ -229,7 +216,6 @@ def main():
             else:
                 if c1.button("▶️ START NOW"):
                     st.session_state.active = True
-                    # Force Immediate Trigger
                     st.session_state.last_ai_check = datetime.now() - timedelta(minutes=5)
                     st.rerun()
             
@@ -237,7 +223,6 @@ def main():
                 bot.close_all_positions()
                 st.toast("Dumped all positions.")
 
-    # --- DASHBOARD ---
     st.title("🤖 AI High-Frequency Scalper")
     
     if not st.session_state.connected:
@@ -254,7 +239,6 @@ def main():
         st.subheader("🧠 Neural Feed")
         log_ph = st.empty()
 
-    # --- LOOP ---
     while True:
         price, account, positions, candles = bot.get_market_data("ETHUSD")
         
@@ -270,33 +254,27 @@ def main():
         time_since = (now - st.session_state.last_ai_check).total_seconds()
         
         if st.session_state.active:
-            # 45 SECONDS DELAY TO PREVENT 429
+            # Check Rate Limit (45s safety)
             if time_since > 45:
                 if safe_to_trade:
                     if len(positions) < 5: 
                         decision, reason = ask_gemini_aggressive(bot, price, candles)
                         
                         timestamp = now.strftime('%H:%M:%S')
+                        log_entry = f"[{timestamp}] {decision}: {reason}"
+                        st.session_state.ai_log.insert(0, log_entry)
+                        st.session_state.last_ai_check = now
                         
-                        # Handle Rate Limit in UI
-                        if "429" in reason:
-                            st.warning(f"⚠️ Rate Limit. Pausing for 60s...")
-                            time.sleep(15) # Extra pause
-                        else:
-                            log_entry = f"[{timestamp}] {decision}: {reason}"
-                            st.session_state.ai_log.insert(0, log_entry)
-                            st.session_state.last_ai_check = now
+                        if "BUY" in decision or "SELL" in decision:
+                            side = "BUY" if "BUY" in decision else "SELL"
+                            size = calculate_trade_size(decision, equity, price)
                             
-                            if "BUY" in decision or "SELL" in decision:
-                                side = "BUY" if "BUY" in decision else "SELL"
-                                size = calculate_trade_size(decision, equity, price)
-                                
-                                if size > 0:
-                                    success, msg = bot.place_order("ETHUSD", side, size)
-                                    if success:
-                                        st.toast(f"⚡ {decision} {size} ETH", icon="🔥")
-                                    else:
-                                        st.session_state.ai_log.insert(0, f"[{timestamp}] EXEC FAIL: {msg}")
+                            if size > 0:
+                                success, msg = bot.place_order("ETHUSD", side, size)
+                                if success:
+                                    st.toast(f"⚡ {decision} {size} ETH", icon="🔥")
+                                else:
+                                    st.session_state.ai_log.insert(0, f"[{timestamp}] EXEC FAIL: {msg}")
                     else:
                         st.session_state.ai_log.insert(0, f"[{now.strftime('%H:%M:%S')}] MAX POSITIONS (5). Holding.")
                 else:
