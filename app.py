@@ -21,7 +21,7 @@ class CapitalClient:
             # --- GEMINI SETUP ---
             genai.configure(api_key=st.secrets["gemini"]["GEMINI_API_KEY"])
             
-            # Auto-select best model (Prioritizing 2.5 Flash)
+            # PRIORITY: Flash-8B (Highest Rate Limit) -> Flash-Lite -> Standard Flash
             self.model_name = self._select_best_model()
             self.model = genai.GenerativeModel(self.model_name)
             
@@ -35,14 +35,22 @@ class CapitalClient:
         self.x_security = None
 
     def _select_best_model(self):
+        """Prioritizes High-Rate-Limit Models."""
         try:
-            available = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-            priorities = ['models/gemini-2.5-flash', 'models/gemini-2.0-flash', 'models/gemini-1.5-flash']
-            for p in priorities:
-                if p in available: return p
-            return "gemini-1.5-flash" # Fallback
+            # 1. Try the specific high-rate-limit model first
+            # "gemini-1.5-flash" has 2x higher RPM limits than standard Flash
+            return "gemini-1.5-flash-8b" 
         except:
-            return "gemini-1.5-flash"
+            # Fallbacks if 8B is not available to key
+            try:
+                available = [m.name for m in genai.list_models()]
+                if 'models/gemini-2.5-flash-lite-preview-02-05' in available:
+                    return 'gemini-2.5-flash-lite-preview-02-05'
+                if 'models/gemini-1.5-flash' in available:
+                    return 'gemini-1.5-flash'
+                return 'gemini-pro'
+            except:
+                return "gemini-1.5-flash"
 
     def _encrypt_password(self, key_b64, timestamp):
         input_str = f"{self.password}|{timestamp}"
@@ -70,8 +78,7 @@ class CapitalClient:
                 self.x_security = r.headers.get('X-SECURITY-TOKEN')
                 return True
             return False
-        except:
-            return False
+        except: return False
 
     def get_market_data(self, epic="ETHUSD"):
         headers = {'X-CAP-API-KEY': self.cap_key, 'CST': self.cst, 'X-SECURITY-TOKEN': self.x_security}
@@ -149,7 +156,7 @@ def ask_gemini_aggressive(bot, price, candles):
             return decision.strip().upper(), reason.strip()
         return "MICRO BUY", "Aggressive Default" 
     except Exception as e:
-        return "HOLD", f"API Error: {str(e)}"
+        return "HOLD", f"API Error: {str(e)[:40]}"
 
 # ==========================================
 # 3. DYNAMIC SIZING
@@ -198,7 +205,6 @@ def main():
         st.session_state.last_ai_check = datetime.now() - timedelta(minutes=5) 
         st.session_state.ai_log = []
         st.session_state.midnight_mode = False
-        st.session_state.cooldown_until = None # NEW: Backoff timer
 
     bot = st.session_state.bot
 
@@ -223,6 +229,7 @@ def main():
             else:
                 if c1.button("▶️ START NOW"):
                     st.session_state.active = True
+                    # Force Immediate Trigger
                     st.session_state.last_ai_check = datetime.now() - timedelta(minutes=5)
                     st.rerun()
             
@@ -260,26 +267,22 @@ def main():
         safe_to_trade = available > reserve_floor
         
         now = datetime.now()
-        
-        # 1. Check if we are in a forced cooldown (from 429 error)
-        in_cooldown = st.session_state.cooldown_until and now < st.session_state.cooldown_until
-        
-        # 2. Check time since last AI call (Standard Rate Limit: 30s)
         time_since = (now - st.session_state.last_ai_check).total_seconds()
         
-        if st.session_state.active and not in_cooldown:
-            if time_since > 30: # INCREASED TO 30s to prevent 429 errors
+        if st.session_state.active:
+            # 45 SECONDS DELAY TO PREVENT 429
+            if time_since > 45:
                 if safe_to_trade:
                     if len(positions) < 5: 
                         decision, reason = ask_gemini_aggressive(bot, price, candles)
                         
-                        # --- ERROR HANDLING ---
+                        timestamp = now.strftime('%H:%M:%S')
+                        
+                        # Handle Rate Limit in UI
                         if "429" in reason:
-                            st.session_state.cooldown_until = now + timedelta(seconds=60) # Wait 60s
-                            st.session_state.ai_log.insert(0, f"[{now.strftime('%H:%M:%S')}] ⚠️ Rate Limit! Pausing AI for 60s...")
+                            st.warning(f"⚠️ Rate Limit. Pausing for 60s...")
+                            time.sleep(15) # Extra pause
                         else:
-                            # Normal Execution
-                            timestamp = now.strftime('%H:%M:%S')
                             log_entry = f"[{timestamp}] {decision}: {reason}"
                             st.session_state.ai_log.insert(0, log_entry)
                             st.session_state.last_ai_check = now
@@ -299,7 +302,6 @@ def main():
                 else:
                     st.session_state.ai_log.insert(0, "⚠️ LOW CASH RESERVE - Pausing Buys")
 
-        # --- UI UPDATE ---
         with header_ph.container():
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("Equity", f"€{equity:,.2f}")
