@@ -9,18 +9,30 @@ import json
 import re
 
 # --- CONFIGURATION ---
-st.set_page_config(page_title="Chain-of-Thought Trader", layout="wide", page_icon="🔗")
+st.set_page_config(page_title="Hedge Fund AI Manager", layout="wide", page_icon="🏦")
 
-# API ENDPOINTS (Demo)
+# API ENDPOINTS
 BASE_URL = "https://demo-api-capital.backend-capital.com" 
 SESSION_URL = f"{BASE_URL}/api/v1/session"
 ACCOUNTS_URL = f"{BASE_URL}/api/v1/accounts"
 POSITIONS_URL = f"{BASE_URL}/api/v1/positions"
 MARKETS_URL = f"{BASE_URL}/api/v1/markets"
 
-WATCHLIST = ["BTCUSD", "ETHUSD", "EURUSD", "GBPUSD", "GOLD", "US500", "TSLA", "AAPL"]
+# DIVERSIFIED PORTFOLIO (15+ Assets)
+FULL_PORTFOLIO = [
+    # Crypto
+    "BTCUSD", "ETHUSD", "XRPUSD",
+    # Forex
+    "EURUSD", "GBPUSD", "USDJPY",
+    # Commodities
+    "GOLD", "OIL_CRUDE", "NATURAL_GAS",
+    # Indices
+    "US500", "US30", "DE40",
+    # Tech Stocks
+    "TSLA", "NVDA", "AAPL"
+]
 
-# --- SECRETS SETUP ---
+# --- SECRETS ---
 try:
     CAP_API_KEY = st.secrets["capital_com"]["api_key"]
     CAP_EMAIL = st.secrets["capital_com"]["email"]
@@ -31,14 +43,14 @@ except:
     st.stop()
 
 genai.configure(api_key=GEMINI_KEY)
+# Using Flash Lite for speed/cost balance
 TARGET_MODEL_NAME = 'gemini-2.5-flash-lite'
 model = genai.GenerativeModel(TARGET_MODEL_NAME)
 
 # --- STATE ---
 if "log_history" not in st.session_state: st.session_state["log_history"] = []
-if "step1_log" not in st.session_state: st.session_state["step1_log"] = "System Ready. Waiting for start..."
-if "step2_log" not in st.session_state: st.session_state["step2_log"] = "System Ready. Waiting for start..."
 if "headers" not in st.session_state: st.session_state["headers"] = None
+if "cycle_status" not in st.session_state: st.session_state["cycle_status"] = "Ready."
 
 # --- FUNCTIONS ---
 
@@ -76,77 +88,53 @@ def execute_trade(headers, epic, direction, size):
     payload = {"epic": epic, "direction": direction, "size": size, "guaranteedStop": False, "trailingStop": False}
     requests.post(POSITIONS_URL, json=payload, headers=headers)
 
-# --- THE 2-STEP AI LOGIC ---
+# --- 2-STEP AI LOGIC ---
 
 def generate_strategy_prompt(epic):
-    """
-    Step 1: Ask AI to create a professional trading persona/strategy for this specific asset.
-    """
+    """Step 1: Get Strategy"""
     meta_prompt = f"""
-    You are a hedge fund manager. 
-    Create a 1-sentence, highly aggressive trading instruction for an analyst to evaluate {epic}.
-    Focus on volatility and breakout potential.
-    Example output: "Act as a momentum scalper and evaluate if BTCUSD is breaking resistance for a quick long."
-    Output ONLY the instruction text.
+    You are a hedge fund manager.
+    Create a 1-sentence aggressive strategy to trade {epic}.
+    Focus on current volatility.
     """
     try:
         response = model.generate_content(meta_prompt)
         return response.text.strip()
     except Exception as e:
-        return f"Act as a scalper and evaluate {epic} for immediate volatility."
+        if "429" in str(e): return "RATE_LIMIT"
+        return f"Analyze {epic} for immediate volatility."
 
 def analyze_market(strategy_instruction, price, change):
-    """
-    Step 2: Send the AI's own strategy back to it with data to get a decision.
-    """
+    """Step 2: Get Decision"""
     final_prompt = f"""
-    INSTRUCTION: {strategy_instruction}
+    STRATEGY: {strategy_instruction}
+    DATA: Price {price} | Change {change}%
     
-    MARKET DATA:
-    - Price: {price}
-    - Daily Change: {change}%
+    TASK: Decide BUY, SELL, or WAIT.
+    Maximize profit. Be aggressive.
     
-    TASK:
-    Follow the instruction above. You MUST make a decision.
-    - If positive momentum: BUY
-    - If negative momentum: SELL
-    - ONLY WAIT if market is flat (0% change).
-    
-    RESPONSE FORMAT (JSON ONLY):
-    {{
-        "action": "BUY" or "SELL" or "WAIT",
-        "confidence": 0-100,
-        "reason": "Brief explanation"
-    }}
+    JSON format: {{"action": "BUY"/"SELL"/"WAIT", "confidence": 0-100, "reason": "brief text"}}
     """
     
-    # Retry logic for Quota (429)
-    for _ in range(3):
-        try:
-            response = model.generate_content(final_prompt)
-            text = response.text.replace("```json", "").replace("```", "").strip()
-            return json.loads(text), final_prompt, text
-        except Exception as e:
-            if "429" in str(e):
-                time.sleep(10) # Wait for quota
-                continue
-            return {"action": "WAIT", "confidence": 0, "reason": str(e)}, final_prompt, str(e)
-            
-    return {"action": "WAIT"}, final_prompt, "Failed"
+    try:
+        response = model.generate_content(final_prompt)
+        text = response.text.replace("```json", "").replace("```", "").strip()
+        return json.loads(text)
+    except Exception as e:
+        if "429" in str(e): return {"action": "RATE_LIMIT"}
+        return {"action": "WAIT", "reason": "Error"}
 
 # --- UI LAYOUT ---
 
-st.title(f"🔗 Chain-of-Thought AI Trader")
+st.title(f"🏦 Hedge Fund AI Manager")
 
-# Sidebar
 with st.sidebar:
     st.header("Control")
-    run_bot = st.toggle("ACTIVATE BOT", key="run_bot")
+    run_bot = st.toggle("START PORTFOLIO SCANNER", key="run_bot")
     if st.button("Reconnect"):
         st.session_state["headers"] = get_session()
         st.rerun()
 
-# Connect
 headers = st.session_state["headers"]
 if not headers:
     headers = get_session()
@@ -159,7 +147,7 @@ if headers:
         st.rerun()
 
     if acct:
-        # 1. TOP METRICS
+        # 1. METRICS
         equity = acct.get('equity', acct.get('balance', 0) + acct.get('profitLoss', 0))
         avail = acct.get('available', 0)
         positions = get_positions(headers)
@@ -172,8 +160,8 @@ if headers:
         
         st.divider()
 
-        # 2. ACTIVE TRADES (TOP PRIORITY)
-        st.subheader("⚔️ Open Positions")
+        # 2. POSITIONS (TOP PRIORITY)
+        st.subheader("⚔️ Active Positions")
         if positions:
             df = pd.DataFrame(positions)
             st.dataframe(
@@ -182,82 +170,99 @@ if headers:
                 column_config={"profitAndLoss": st.column_config.NumberColumn("P&L", format="$%.2f")}
             )
         else:
-            st.info("No trades open. Waiting for AI trigger...")
+            st.info("No trades open. Scanning portfolio...")
 
         st.divider()
 
-        # 3. AI CHAIN LOGS (Step 1 -> Step 2)
-        with st.expander("🧠 Live AI Decision Chain (Click to View)", expanded=True):
-            c1, c2 = st.columns(2)
-            with c1:
-                st.markdown("**Step 1: AI Generated Strategy**")
-                st.info(st.session_state["step1_log"])
-            with c2:
-                st.markdown("**Step 2: AI Execution Decision**")
-                st.success(st.session_state["step2_log"])
-            
-            if st.session_state["log_history"]:
-                st.dataframe(pd.DataFrame(st.session_state["log_history"]), use_container_width=True)
+        # 3. LIVE SESSION LOGS
+        st.subheader("📜 Live Session Log")
+        if st.session_state["log_history"]:
+            # Create a nice table from the history
+            log_df = pd.DataFrame(st.session_state["log_history"])
+            st.dataframe(
+                log_df, 
+                use_container_width=True, 
+                hide_index=True,
+                column_config={
+                    "Conf": st.column_config.TextColumn("Conf", width="small"),
+                    "Action": st.column_config.TextColumn("Action", width="small"),
+                }
+            )
+        else:
+            st.caption("Waiting for first scan batch...")
 
-        # 4. EXECUTION LOOP
+        # --- EXECUTION LOOP ---
         if run_bot:
             status_box = st.empty()
-            with status_box.status("⚙️ AI Chain Running...", expanded=True) as status:
-                
-                # A. Select Asset
-                target = random.choice(WATCHLIST)
-                status.write(f"1. Selected Asset: **{target}**")
-                
-                try:
-                    # B. Get Data
-                    mkt = requests.get(f"{MARKETS_URL}/{target}", headers=headers).json()
-                    
-                    if 'snapshot' in mkt:
-                        snap = mkt['snapshot']
-                        price = snap.get('offer', snap.get('bid', 0))
-                        change = snap.get('dailyChange', 0)
-                        
-                        # C. Step 1: Ask AI for Strategy
-                        status.write("2. Asking AI for professional prompt...")
-                        strategy_prompt = generate_strategy_prompt(target)
-                        st.session_state["step1_log"] = strategy_prompt # Update UI
-                        
-                        # D. Step 2: Analyze using that Strategy
-                        status.write("3. Analyzing market data...")
-                        decision, prompt_sent, raw_resp = analyze_market(strategy_prompt, price, change)
-                        
-                        # Update UI Logs
-                        action = decision.get('action', 'WAIT')
-                        conf = decision.get('confidence', 0)
-                        st.session_state["step2_log"] = f"Decision: {action} ({conf}%) | Reason: {decision.get('reason')}"
-                        
-                        # Add to History
-                        new_log = {
-                            "Time": datetime.now().strftime("%H:%M:%S"),
-                            "Asset": target,
-                            "Strategy": strategy_prompt[:50]+"...",
-                            "Action": action,
-                            "Conf": f"{conf}%"
-                        }
-                        st.session_state["log_history"].insert(0, new_log)
-                        
-                        # E. Execute
-                        if action in ["BUY", "SELL"] and conf > 50:
-                            if avail > 50:
-                                status.write(f"🚀 EXECUTING {action}!")
-                                size = 0.01 if "BTC" in target else 1
-                                execute_trade(headers, target, action, size)
-                                st.toast(f"✅ {action} {target} Executed!")
-                            else:
-                                st.error("Insufficient Funds")
-                        else:
-                            status.write("Confidence too low.")
-                    
-                except Exception as e:
-                    status.write(f"Error: {e}")
             
-            # F. Cooldown (60s to save quota)
-            for s in range(60, 0, -1):
-                status_box.info(f"⏳ Cycle Complete. Next scan in {s}s")
-                time.sleep(1)
+            # BATCH LOGIC: Select 5 random assets to scan this minute
+            # This prevents 429 Rate Limits (Quota)
+            batch = random.sample(FULL_PORTFOLIO, 5)
+            
+            with status_box.status(f"⚡ Scanning Batch: {', '.join(batch)}", expanded=True) as status:
+                
+                for i, target in enumerate(batch):
+                    status.write(f"**({i+1}/5) Analyzing {target}...**")
+                    
+                    try:
+                        # 1. Get Data
+                        mkt = requests.get(f"{MARKETS_URL}/{target}", headers=headers).json()
+                        
+                        if 'snapshot' in mkt:
+                            snap = mkt['snapshot']
+                            price = snap.get('offer', snap.get('bid', 0))
+                            change = snap.get('dailyChange', 0)
+                            
+                            # 2. Step 1 (Strategy)
+                            strategy = generate_strategy_prompt(target)
+                            if strategy == "RATE_LIMIT":
+                                status.warning("Rate Limit Hit. Cooling down 15s...")
+                                time.sleep(15)
+                                continue
+
+                            # 3. Step 2 (Decision)
+                            decision = analyze_market(strategy, price, change)
+                            
+                            action = decision.get('action', 'WAIT')
+                            
+                            if action == "RATE_LIMIT":
+                                status.warning("Rate Limit Hit. Cooling down...")
+                                time.sleep(15)
+                                continue
+
+                            conf = decision.get('confidence', 0)
+                            reason = decision.get('reason', '-')
+                            
+                            # Add to Log
+                            new_log = {
+                                "Time": datetime.now().strftime("%H:%M:%S"),
+                                "Asset": target,
+                                "Action": action,
+                                "Conf": f"{conf}%",
+                                "Reason": reason
+                            }
+                            st.session_state["log_history"].insert(0, new_log)
+                            # Keep log clean (last 20)
+                            if len(st.session_state["log_history"]) > 20:
+                                st.session_state["log_history"].pop()
+                            
+                            # 4. Execute
+                            if action in ["BUY", "SELL"] and conf > 60:
+                                if avail > 100:
+                                    status.write(f"🚀 **EXECUTING {action}!**")
+                                    # Sizing: Crypto needs small size (0.01), Stocks need 1
+                                    size = 0.01 if "USD" in target and "BTC" in target else 1
+                                    execute_trade(headers, target, action, size)
+                                    st.toast(f"✅ Trade Sent: {target}")
+                                else:
+                                    st.error("Insufficient Funds")
+                            
+                            # SMART DELAY (12s per asset = 60s total for 5 assets)
+                            # This keeps us under the 15 request/min limit
+                            time.sleep(10) 
+                            
+                    except Exception as e:
+                        status.write(f"Error on {target}: {e}")
+            
+            # Loop Reset
             st.rerun()
