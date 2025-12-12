@@ -9,7 +9,7 @@ import random
 import json
 
 # --- CONFIGURATION ---
-st.set_page_config(page_title="AI Neural Trader", layout="wide", page_icon="🧠")
+st.set_page_config(page_title="Gemini 2.5 Flash Trader", layout="wide", page_icon="⚡")
 
 # ⚠️ DEMO API (Switch to live only when ready)
 BASE_URL = "https://demo-api-capital.backend-capital.com" 
@@ -21,7 +21,7 @@ MARKETS_URL = f"{BASE_URL}/api/v1/markets"
 
 WATCHLIST = ["BTCUSD", "ETHUSD", "EURUSD", "GBPUSD", "GOLD", "US500", "TSLA", "AAPL"]
 
-# --- SECRETS CHECK ---
+# --- SECRETS & MODEL SETUP ---
 try:
     CAP_API_KEY = st.secrets["capital_com"]["api_key"]
     CAP_EMAIL = st.secrets["capital_com"]["email"]
@@ -32,13 +32,21 @@ except:
     st.stop()
 
 genai.configure(api_key=GEMINI_KEY)
-model = genai.GenerativeModel('gemini-pro')
+
+# ⚠️ FORCE USING GEMINI 2.5 FLASH LITE ⚠️
+# If this fails, check the "Available Models" in the sidebar
+TARGET_MODEL_NAME = 'gemini-2.5-flash-lite' 
+
+try:
+    model = genai.GenerativeModel(TARGET_MODEL_NAME)
+except Exception as e:
+    st.error(f"Error init model: {e}")
 
 # --- SESSION STATE INITIALIZATION ---
 if "log_history" not in st.session_state: st.session_state["log_history"] = []
 if "headers" not in st.session_state: st.session_state["headers"] = None
-if "last_prompt" not in st.session_state: st.session_state["last_prompt"] = "Waiting for start..."
-if "last_response" not in st.session_state: st.session_state["last_response"] = "Waiting for start..."
+if "last_prompt" not in st.session_state: st.session_state["last_prompt"] = "Waiting..."
+if "last_response" not in st.session_state: st.session_state["last_response"] = "Waiting..."
 
 # --- HELPER FUNCTIONS ---
 
@@ -82,46 +90,57 @@ def execute_trade(headers, epic, direction, size):
 
 def ask_gemini(epic, price, change):
     """
-    Communicates with Gemini API.
-    Returns: (Decision Dict, Raw Prompt String, Raw Response String)
+    Communicates with Gemini 2.5 Flash Lite.
     """
-    # 1. Construct the Prompt (The input to the Brain)
+    # 1. Prompt Construction
     prompt = f"""
-    Act as a high-frequency trading algorithm.
+    You are a high-frequency trading algorithm using Gemini 2.5 Flash Lite.
     Current Market Data:
     - Asset: {epic}
     - Price: {price}
     - Daily Change: {change}%
     
     INSTRUCTIONS:
-    1. Analyze the change. If it is moving fast, jump in.
+    1. Analyze the volatility.
     2. Output strictly JSON.
     3. Format: {{"action": "BUY" or "SELL" or "WAIT", "confidence": 0-100, "reason": "brief reason"}}
     """
     
     try:
-        # 2. Send to Google (The Communication)
+        # 2. Generate Content
         response = model.generate_content(prompt)
         
-        # 3. Clean the Response
+        # 3. Parse
         raw_text = response.text
         clean_json = raw_text.replace("```json", "").replace("```", "").strip()
         
         return json.loads(clean_json), prompt, raw_text
     except Exception as e:
-        return {"action": "WAIT", "confidence": 0, "reason": str(e)}, prompt, str(e)
+        return {"action": "WAIT", "confidence": 0, "reason": f"AI Error: {str(e)}"}, prompt, str(e)
 
 # --- DASHBOARD UI ---
 
-st.title("🧠 Transparent AI Trader")
+st.title(f"⚡ {TARGET_MODEL_NAME} Auto-Trader")
 
 # Sidebar Controls
 with st.sidebar:
     st.header("Control Center")
     run_bot = st.toggle("ACTIVATE BOT", key="bot_active")
-    if st.button("Force Reconnect"):
+    
+    st.divider()
+    if st.button("Reconnect Capital.com"):
         st.session_state["headers"] = get_session()
         st.rerun()
+
+    # DEBUG: Show available models to verify the name exists
+    with st.expander("🔎 Check Available Models"):
+        try:
+            st.write("Models available to your API key:")
+            for m in genai.list_models():
+                if 'generateContent' in m.supported_generation_methods:
+                    st.code(m.name)
+        except Exception as e:
+            st.error(e)
 
 # 1. Connect
 headers = st.session_state["headers"]
@@ -151,17 +170,15 @@ if headers:
 
         st.divider()
 
-        # --- LIVE AI WIRETAP (THE "HOW IT WORKS" PART) ---
+        # --- LIVE AI WIRETAP ---
         c1, c2 = st.columns(2)
         
         with c1:
-            st.subheader("📡 Outgoing -> Gemini API")
-            st.caption("This is the exact data packet we send to Google:")
+            st.subheader("📡 Outgoing Prompt")
             st.code(st.session_state["last_prompt"], language="text")
             
         with c2:
-            st.subheader("📥 Incoming <- Gemini API")
-            st.caption("This is the raw logic returned by the AI:")
+            st.subheader(f"📥 {TARGET_MODEL_NAME} Response")
             st.code(st.session_state["last_response"], language="json")
 
         st.divider()
@@ -170,7 +187,7 @@ if headers:
         c_log, c_pos = st.columns(2)
         
         with c_log:
-            st.subheader("📜 AI Thought History")
+            st.subheader("📜 Decision Log")
             if st.session_state["log_history"]:
                 df_log = pd.DataFrame(st.session_state["log_history"])
                 st.dataframe(df_log, use_container_width=True, hide_index=True)
@@ -186,11 +203,11 @@ if headers:
 
         # --- MAIN EXECUTION LOOP ---
         if run_bot:
-            with st.status("🤖 AI is thinking...", expanded=True) as status:
+            with st.status("⚡ 2.5 Flash Lite is thinking...", expanded=True) as status:
                 
                 # 1. Pick Target
                 target = random.choice(WATCHLIST)
-                status.write(f"Scanning market for: **{target}**")
+                status.write(f"Scanning: **{target}**")
                 
                 try:
                     # 2. Fetch Market Data
@@ -201,9 +218,9 @@ if headers:
                         price = snap.get('offer', snap.get('bid', 0))
                         change = snap.get('dailyChange', 0)
                         
-                        status.write(f"Data acquired: Price ${price} | Change {change}%")
+                        status.write(f"Price: ${price} | Change: {change}%")
                         
-                        # 3. ASK GEMINI (Capture Inputs/Outputs)
+                        # 3. ASK GEMINI 2.5
                         decision, raw_prompt, raw_resp = ask_gemini(target, price, change)
                         
                         # Save for UI Display
@@ -223,13 +240,12 @@ if headers:
                             "Reason": decision.get("reason", "-")
                         }
                         st.session_state["log_history"].insert(0, new_log)
-                        # Keep list short
                         if len(st.session_state["log_history"]) > 10:
                             st.session_state["log_history"].pop()
 
                         # 5. Execute Trade
                         if action in ["BUY", "SELL"] and conf > 60:
-                            if avail > 100: # Check funds
+                            if avail > 100: 
                                 status.write(f"🚀 EXECUTING {action}!")
                                 size = 0.01 if "BTC" in target else 1
                                 execute_trade(headers, target, action, size)
@@ -237,11 +253,10 @@ if headers:
                             else:
                                 st.warning("Insufficient funds")
                         else:
-                            status.write("Confidence too low. Waiting.")
+                            status.write("Confidence too low.")
 
                 except Exception as e:
                     status.write(f"Error: {e}")
             
-            # Short pause then refresh UI
             time.sleep(1.5)
             st.rerun()
