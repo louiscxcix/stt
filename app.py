@@ -18,11 +18,11 @@ class CapitalClient:
             self.login = st.secrets["capital_com"]["email"]
             self.password = st.secrets["capital_com"]["password"]
             
-            # --- GEMINI SETUP WITH FALLBACKS ---
+            # --- GEMINI SETUP ---
             genai.configure(api_key=st.secrets["gemini"]["GEMINI_API_KEY"])
             
-            # Default to Flash, but we will handle errors dynamically
-            self.model_name = 'gemini-1.5-flash'
+            # 1. Try Specific Flash Models
+            self.model_name = self._select_best_model()
             self.model = genai.GenerativeModel(self.model_name)
             
         except Exception as e:
@@ -33,6 +33,34 @@ class CapitalClient:
         self.session = requests.Session()
         self.cst = None
         self.x_security = None
+
+    def _select_best_model(self):
+        """Prioritizes Flash models for speed."""
+        try:
+            # Get list of available models for this API key
+            available = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
+            
+            # Priority List
+            priorities = [
+                'models/gemini-1.5-flash',
+                'models/gemini-2.0-flash-exp',
+                'models/gemini-pro',
+                'models/gemini-1.0-pro'
+            ]
+            
+            # Match priority against available
+            for p in priorities:
+                if p in available: return p
+                
+            # If explicit match fails, find any flash
+            for m in available:
+                if 'flash' in m: return m
+                
+            # Last resort
+            return available[0]
+        except:
+            # If listing fails, force standard flash
+            return "gemini-1.5-flash"
 
     def _encrypt_password(self, key_b64, timestamp):
         input_str = f"{self.password}|{timestamp}"
@@ -108,22 +136,8 @@ class CapitalClient:
             for p in r.json()['positions']:
                 self.session.delete(f"{self.base_url}/api/v1/positions/{p['dealId']}", headers=headers)
 
-    # --- ROBUST AI SWITCHER ---
-    def switch_model(self):
-        """ Cycles through known working models if one fails """
-        alternatives = ['gemini-1.5-flash', 'gemini-pro', 'gemini-1.0-pro']
-        try:
-            current_idx = alternatives.index(self.model_name)
-            next_idx = (current_idx + 1) % len(alternatives)
-        except:
-            next_idx = 0
-            
-        self.model_name = alternatives[next_idx]
-        self.model = genai.GenerativeModel(self.model_name)
-        return self.model_name
-
 # ==========================================
-# 2. AI MANAGER
+# 2. AI MANAGER (AGGRESSIVE)
 # ==========================================
 def ask_gemini_aggressive(bot, price, candles):
     if not candles or len(candles) < 3:
@@ -159,19 +173,9 @@ def ask_gemini_aggressive(bot, price, candles):
             decision, reason = text.split("|", 1)
             return decision.strip().upper(), reason.strip()
         return "MICRO BUY", "Aggressive Default" 
-        
     except Exception as e:
-        error_msg = str(e)
-        
-        # --- SELF HEALING LOGIC ---
-        if "404" in error_msg:
-            new_model = bot.switch_model()
-            return "HOLD", f"Model 404. Switched to {new_model}. Retrying next loop..."
-            
-        elif "429" in error_msg:
-            return "HOLD", "Gemini Rate Limit (Cooling down)"
-        else:
-            return "HOLD", f"API Fail: {error_msg[:20]}"
+        # Better Error Reporting
+        return "HOLD", f"API Error: {str(e)[:40]}"
 
 # ==========================================
 # 3. DYNAMIC SIZING
@@ -197,7 +201,7 @@ def calculate_trade_size(decision, equity, price):
     return round(size, 2)
 
 # ==========================================
-# 4. MAIN UI LOOP
+# 4. MAIN LOOP
 # ==========================================
 def main():
     st.set_page_config(page_title="AI Scalper", page_icon="⚡", layout="wide")
@@ -223,10 +227,9 @@ def main():
 
     bot = st.session_state.bot
 
-    # --- SIDEBAR ---
     with st.sidebar:
         st.title("⚡ Scalper Admin")
-        st.caption(f"🤖 Current AI: {bot.model_name}")
+        st.caption(f"🧠 Brain: {bot.model_name}")
         
         if not st.session_state.connected:
             if st.button("🔌 Connect", type="primary"):
@@ -251,7 +254,6 @@ def main():
                 bot.close_all_positions()
                 st.toast("Dumped all positions.")
 
-    # --- DASHBOARD ---
     st.title("🤖 AI High-Frequency Scalper")
     
     if not st.session_state.connected:
@@ -268,9 +270,7 @@ def main():
         st.subheader("🧠 Neural Feed")
         log_ph = st.empty()
 
-    # --- LOOP ---
     while True:
-        # 1. Live Data
         price, account, positions, candles = bot.get_market_data("ETHUSD")
         
         equity = account.get('equity', 0)
@@ -281,7 +281,6 @@ def main():
         reserve_floor = equity * 0.20
         safe_to_trade = available > reserve_floor
         
-        # 2. AI Cycle
         now = datetime.now()
         time_since = (now - st.session_state.last_ai_check).total_seconds()
         
@@ -311,7 +310,6 @@ def main():
                 else:
                     st.session_state.ai_log.insert(0, "⚠️ LOW CASH RESERVE - Pausing Buys")
 
-        # --- UI UPDATE ---
         with header_ph.container():
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("Equity", f"€{equity:,.2f}")
