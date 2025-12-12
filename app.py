@@ -7,6 +7,7 @@ from datetime import datetime
 import pytz
 import random
 import json
+import re
 
 # --- CONFIGURATION ---
 st.set_page_config(page_title="Gemini 2.5 Flash Trader", layout="wide", page_icon="⚡")
@@ -33,14 +34,9 @@ except:
 
 genai.configure(api_key=GEMINI_KEY)
 
-# ⚠️ FORCE USING GEMINI 2.5 FLASH LITE ⚠️
-# If this fails, check the "Available Models" in the sidebar
+# Using Flash Lite (Note: If 2.5 is too restricted, try 'gemini-1.5-flash')
 TARGET_MODEL_NAME = 'gemini-2.5-flash-lite' 
-
-try:
-    model = genai.GenerativeModel(TARGET_MODEL_NAME)
-except Exception as e:
-    st.error(f"Error init model: {e}")
+model = genai.GenerativeModel(TARGET_MODEL_NAME)
 
 # --- SESSION STATE INITIALIZATION ---
 if "log_history" not in st.session_state: st.session_state["log_history"] = []
@@ -88,39 +84,84 @@ def execute_trade(headers, epic, direction, size):
     payload = {"epic": epic, "direction": direction, "size": size, "guaranteedStop": False, "trailingStop": False}
     requests.post(POSITIONS_URL, json=payload, headers=headers)
 
-def ask_gemini(epic, price, change):
+# --- ADVANCED PROMPT GENERATOR ---
+def generate_varied_prompt(epic, price, change):
     """
-    Communicates with Gemini 2.5 Flash Lite.
+    Creates a unique, professional prompt every time to force the AI to think differently.
     """
-    # 1. Prompt Construction
+    personas = [
+        "The High-Frequency Scalper (Focus: Speed, Momentum, Instant Execution)",
+        "The Contrarian Analyst (Focus: Overbought/Oversold Reversals)",
+        "The Macro Risk Manager (Focus: Safety, Trend Confirmation, Volume)",
+        "The Technical Chartist (Focus: Support/Resistance Breakouts)",
+        "The Volatility Hunter (Focus: Large % Changes, Aggressive Entries)"
+    ]
+    
+    selected_persona = random.choice(personas)
+    
     prompt = f"""
-    You are a high-frequency trading algorithm using Gemini 2.5 Flash Lite.
-    Current Market Data:
+    IDENTITY: You are an elite algorithmic trader acting as: {selected_persona}.
+    
+    MARKET DATA:
     - Asset: {epic}
-    - Price: {price}
+    - Current Price: {price}
     - Daily Change: {change}%
     
-    INSTRUCTIONS:
-    1. Analyze the volatility.
-    2. Output strictly JSON.
-    3. Format: {{"action": "BUY" or "SELL" or "WAIT", "confidence": 0-100, "reason": "brief reason"}}
-    """
+    TASK:
+    Analyze the data strictly through the lens of your assigned persona.
+    If the data fits your specific strategy, execute aggressively. 
+    If it is ambiguous, HOLD.
     
-    try:
-        # 2. Generate Content
-        response = model.generate_content(prompt)
-        
-        # 3. Parse
-        raw_text = response.text
-        clean_json = raw_text.replace("```json", "").replace("```", "").strip()
-        
-        return json.loads(clean_json), prompt, raw_text
-    except Exception as e:
-        return {"action": "WAIT", "confidence": 0, "reason": f"AI Error: {str(e)}"}, prompt, str(e)
+    RESPONSE FORMAT (Strict JSON):
+    {{
+        "action": "BUY" or "SELL" or "WAIT",
+        "confidence": 0-100,
+        "reason": "Professional analysis relative to {selected_persona}"
+    }}
+    """
+    return prompt
+
+def ask_gemini_robust(epic, price, change):
+    """
+    Communicates with Gemini and handles 429 Errors (Quota Exceeded) automatically.
+    """
+    prompt = generate_varied_prompt(epic, price, change)
+    max_retries = 3
+    
+    for attempt in range(max_retries):
+        try:
+            # 1. Send Request
+            response = model.generate_content(prompt)
+            
+            # 2. Parse Response
+            raw_text = response.text
+            clean_json = raw_text.replace("```json", "").replace("```", "").strip()
+            
+            return json.loads(clean_json), prompt, raw_text
+            
+        except Exception as e:
+            error_msg = str(e)
+            
+            # 3. CATCH 429 QUOTA ERRORS
+            if "429" in error_msg or "Quota exceeded" in error_msg:
+                st.toast(f"⚠️ Quota Hit (Attempt {attempt+1}/{max_retries}). Retrying...", icon="⏳")
+                
+                # Try to find the specific wait time in the error message (e.g. "retry in 17s")
+                match = re.search(r"retry in (\d+\.?\d*)s", error_msg)
+                wait_time = float(match.group(1)) + 1 if match else 20
+                
+                # Wait professionally
+                time.sleep(wait_time)
+                continue # Retry loop
+            
+            # If it's another error (not 429), break and return failure
+            return {"action": "WAIT", "confidence": 0, "reason": f"Error: {error_msg}"}, prompt, error_msg
+
+    return {"action": "WAIT", "confidence": 0, "reason": "Max Retries Exceeded"}, prompt, "Failed"
 
 # --- DASHBOARD UI ---
 
-st.title(f"⚡ {TARGET_MODEL_NAME} Auto-Trader")
+st.title(f"⚡ {TARGET_MODEL_NAME} Pro Trader")
 
 # Sidebar Controls
 with st.sidebar:
@@ -132,15 +173,13 @@ with st.sidebar:
         st.session_state["headers"] = get_session()
         st.rerun()
 
-    # DEBUG: Show available models to verify the name exists
-    with st.expander("🔎 Check Available Models"):
+    with st.expander("🔎 Models"):
         try:
-            st.write("Models available to your API key:")
+            st.write("Available Models:")
             for m in genai.list_models():
                 if 'generateContent' in m.supported_generation_methods:
-                    st.code(m.name)
-        except Exception as e:
-            st.error(e)
+                    st.caption(m.name)
+        except: pass
 
 # 1. Connect
 headers = st.session_state["headers"]
@@ -151,7 +190,6 @@ if not headers:
 if headers:
     acct = get_account_safe(headers)
     
-    # Auth Check
     if acct == "UNAUTHORIZED":
         st.session_state["headers"] = get_session()
         st.rerun()
@@ -174,11 +212,12 @@ if headers:
         c1, c2 = st.columns(2)
         
         with c1:
-            st.subheader("📡 Outgoing Prompt")
+            st.subheader("📡 Varied Outgoing Prompt")
+            st.caption("Notice how the 'Identity' changes every scan:")
             st.code(st.session_state["last_prompt"], language="text")
             
         with c2:
-            st.subheader(f"📥 {TARGET_MODEL_NAME} Response")
+            st.subheader(f"📥 {TARGET_MODEL_NAME} Analysis")
             st.code(st.session_state["last_response"], language="json")
 
         st.divider()
@@ -203,11 +242,13 @@ if headers:
 
         # --- MAIN EXECUTION LOOP ---
         if run_bot:
-            with st.status("⚡ 2.5 Flash Lite is thinking...", expanded=True) as status:
+            status_box = st.empty()
+            
+            with status_box.status("⚡ AI is analyzing markets...", expanded=True) as status:
                 
                 # 1. Pick Target
                 target = random.choice(WATCHLIST)
-                status.write(f"Scanning: **{target}**")
+                status.write(f"Target Acquired: **{target}**")
                 
                 try:
                     # 2. Fetch Market Data
@@ -218,17 +259,18 @@ if headers:
                         price = snap.get('offer', snap.get('bid', 0))
                         change = snap.get('dailyChange', 0)
                         
-                        status.write(f"Price: ${price} | Change: {change}%")
+                        status.write(f"Price: {price} | Volatility: {change}%")
                         
-                        # 3. ASK GEMINI 2.5
-                        decision, raw_prompt, raw_resp = ask_gemini(target, price, change)
+                        # 3. ASK GEMINI (With 429 Auto-Fix)
+                        decision, raw_prompt, raw_resp = ask_gemini_robust(target, price, change)
                         
-                        # Save for UI Display
+                        # Save for UI
                         st.session_state["last_prompt"] = raw_prompt
                         st.session_state["last_response"] = raw_resp
                         
                         action = decision.get('action', 'WAIT')
                         conf = decision.get('confidence', 0)
+                        reason = decision.get('reason', '-')
                         
                         # 4. Update Logs
                         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -237,11 +279,10 @@ if headers:
                             "Asset": target, 
                             "Action": action, 
                             "Conf": f"{conf}%",
-                            "Reason": decision.get("reason", "-")
+                            "Reason": reason
                         }
                         st.session_state["log_history"].insert(0, new_log)
-                        if len(st.session_state["log_history"]) > 10:
-                            st.session_state["log_history"].pop()
+                        if len(st.session_state["log_history"]) > 10: st.session_state["log_history"].pop()
 
                         # 5. Execute Trade
                         if action in ["BUY", "SELL"] and conf > 60:
@@ -253,10 +294,15 @@ if headers:
                             else:
                                 st.warning("Insufficient funds")
                         else:
-                            status.write("Confidence too low.")
+                            status.write(f"Action: {action} (Confidence {conf}%)")
 
                 except Exception as e:
-                    status.write(f"Error: {e}")
+                    status.write(f"Loop Error: {e}")
             
-            time.sleep(1.5)
+            # 6. WAIT FOR 1 MINUTE (With Countdown)
+            # 60s is usually enough to clear the basic Flash Lite rate limit buffer
+            for seconds_left in range(60, 0, -1):
+                status_box.info(f"⏳ Cooling down... Next scan in: {seconds_left}s")
+                time.sleep(1)
+            
             st.rerun()
