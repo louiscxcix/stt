@@ -8,7 +8,7 @@ import json
 import random
 
 # --- CONFIGURATION ---
-st.set_page_config(page_title="Portfolio AI Manager", layout="wide", page_icon="🏢")
+st.set_page_config(page_title="Hyper-Aggressive Scalper", layout="wide", page_icon="💀")
 
 # API ENDPOINTS
 BASE_URL = "https://demo-api-capital.backend-capital.com" 
@@ -17,13 +17,13 @@ ACCOUNTS_URL = f"{BASE_URL}/api/v1/accounts"
 POSITIONS_URL = f"{BASE_URL}/api/v1/positions"
 MARKETS_URL = f"{BASE_URL}/api/v1/markets"
 
-# MASSIVE PORTFOLIO
+# MASSIVE WATCHLIST
 PORTFOLIO = [
-    "BTCUSD", "ETHUSD", "XRPUSD", "LTCUSD",      # Crypto
-    "EURUSD", "GBPUSD", "USDJPY", "AUDUSD",      # Forex
-    "GOLD", "SILVER", "OIL_CRUDE",               # Commodities
-    "US500", "US30", "DE40", "JP225",            # Indices
-    "TSLA", "NVDA", "AAPL", "MSFT", "AMZN"       # Stocks
+    "BTCUSD", "ETHUSD", "XRPUSD", "LTCUSD", "DOGEUSD", # Crypto
+    "EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD",  # Forex
+    "GOLD", "SILVER", "OIL_CRUDE", "NATURAL_GAS",      # Commodities
+    "US500", "US30", "DE40", "JP225", "FR40",          # Indices
+    "TSLA", "NVDA", "AAPL", "MSFT", "AMZN", "META"     # Stocks
 ]
 
 # --- SECRETS ---
@@ -37,13 +37,13 @@ except:
     st.stop()
 
 genai.configure(api_key=GEMINI_KEY)
-# Using Flash Lite for large context windows
+# Using Flash Lite for speed
 model = genai.GenerativeModel('gemini-2.5-flash-lite')
 
 # --- STATE ---
 if "log_history" not in st.session_state: st.session_state["log_history"] = []
 if "headers" not in st.session_state: st.session_state["headers"] = None
-if "last_raw_response" not in st.session_state: st.session_state["last_raw_response"] = "Waiting for first scan..."
+if "last_raw" not in st.session_state: st.session_state["last_raw"] = "Waiting..."
 
 # --- FUNCTIONS ---
 
@@ -82,7 +82,6 @@ def execute_trade(headers, epic, direction, size):
     requests.post(POSITIONS_URL, json=payload, headers=headers)
 
 def fetch_market_batch(headers, assets):
-    """Fetches price data for MULTIPLE assets at once."""
     batch_data = []
     for asset in assets:
         try:
@@ -99,55 +98,50 @@ def fetch_market_batch(headers, assets):
         except: pass
     return batch_data
 
-def analyze_portfolio_batch(market_data_list):
+def analyze_portfolio_aggressive(market_data_list):
     """
-    SENDS ONE MASSIVE PROMPT TO GEMINI.
+    FORCED TRADING PROMPT
     """
     data_str = json.dumps(market_data_list, indent=2)
     
     prompt = f"""
-    You are a Hedge Fund Manager.
-    Here is live market data:
-    {data_str}
+    You are a DEGENERATE HIGH-FREQUENCY SCALPER.
+    Live Data: {data_str}
     
-    TASK:
-    1. Scan for High Volatility opportunities.
-    2. Select the Top 3 trades (if any).
-    3. Be Aggressive.
+    RULES:
+    1. You MUST pick the top 3 assets to trade. Do NOT return an empty list.
+    2. Ignore safety. We want volume.
+    3. If momentum is slightly up, BUY. If slightly down, SELL.
+    4. Even 0.1% change is enough to trade.
     
-    RESPONSE FORMAT (JSON LIST):
+    RESPONSE JSON LIST:
     [
-        {{"asset": "BTCUSD", "action": "BUY", "confidence": 85, "reason": "Momentum breakout"}},
+        {{"asset": "BTCUSD", "action": "BUY", "confidence": 90, "reason": "Slight pump"}},
         ...
     ]
-    If market is boring, return [] (empty list).
     """
     
     try:
         response = model.generate_content(prompt)
         text = response.text.replace("```json", "").replace("```", "").strip()
-        st.session_state["last_raw_response"] = text # Save for debug
+        st.session_state["last_raw"] = text
         return json.loads(text)
     except Exception as e:
-        st.session_state["last_raw_response"] = f"Error: {e}"
+        st.session_state["last_raw"] = str(e)
         return []
 
 # --- UI LAYOUT ---
 
-st.title(f"🏢 Portfolio AI Manager")
+st.title(f"💀 Hyper-Aggressive Scalper")
 
-# Sidebar
 with st.sidebar:
     st.header("Control")
-    run_bot = st.toggle("ACTIVATE FUND MANAGER", key="run_bot")
+    run_bot = st.toggle("ACTIVATE SCALPER", key="run_bot")
     if st.button("Reconnect"):
         st.session_state["headers"] = get_session()
         st.rerun()
-        
-    st.divider()
-    with st.expander("🛠️ Debug: Raw AI Output"):
-        st.caption("See exactly what Gemini replied in the last cycle:")
-        st.code(st.session_state["last_raw_response"], language="json")
+    with st.expander("Debug Raw AI"):
+        st.code(st.session_state["last_raw"], language="json")
 
 # Connect
 headers = st.session_state["headers"]
@@ -171,11 +165,11 @@ if headers:
         m1.metric("Equity", f"${equity:,.0f}")
         m2.metric("Available", f"${avail:,.0f}")
         m3.metric("P&L", f"${acct.get('profitLoss', 0):,.2f}")
-        m4.metric("Active Trades", len(positions))
+        m4.metric("Open Trades", len(positions))
         
         st.divider()
 
-        # 2. POSITIONS (TOP PRIORITY)
+        # 2. ACTIVE POSITIONS
         st.subheader("⚔️ Active Positions")
         if positions:
             df = pd.DataFrame(positions)
@@ -185,58 +179,38 @@ if headers:
                 column_config={"profitAndLoss": st.column_config.NumberColumn("P&L", format="$%.2f")}
             )
         else:
-            st.info("No trades currently open.")
+            st.info("No trades yet. Bot will open some soon.")
 
         st.divider()
 
-        # 3. LIVE ACTIVITY LOG (Folded)
-        with st.expander("📜 Live System Log (Click to View)", expanded=True):
+        # 3. LIVE LOGS
+        with st.expander("📜 Live Action Log", expanded=True):
             if st.session_state["log_history"]:
                 log_df = pd.DataFrame(st.session_state["log_history"])
-                st.dataframe(
-                    log_df, 
-                    use_container_width=True, 
-                    hide_index=True,
-                    column_config={
-                        "Action": st.column_config.TextColumn("Action"),
-                        "Details": st.column_config.TextColumn("Details", width="large"),
-                    }
-                )
+                st.dataframe(log_df, use_container_width=True, hide_index=True)
             else:
-                st.caption("Log is empty. Waiting for start...")
+                st.caption("Waiting for first aggressive scan...")
 
         # --- EXECUTION LOOP ---
         if run_bot:
             status_box = st.empty()
             
-            # Select 8 random assets for this batch
-            batch = random.sample(PORTFOLIO, 8)
-            batch_names = ", ".join(batch[:3]) + "..."
+            # Select 10 assets for max coverage
+            batch = random.sample(PORTFOLIO, 10)
             
-            with status_box.status(f"⚡ Scanning Batch: {batch_names}", expanded=True) as status:
+            with status_box.status(f"⚡ Aggressively Scanning 10 Assets...", expanded=True) as status:
                 
-                # A. Fetch Data
-                status.write("Fetching market prices...")
+                # A. Fetch
                 market_data = fetch_market_batch(headers, batch)
                 
                 if market_data:
-                    status.write(f"Analyzing {len(market_data)} assets with Gemini 2.5...")
-                    
-                    # B. AI Analysis
-                    decisions = analyze_portfolio_batch(market_data)
+                    # B. Force AI Decision
+                    decisions = analyze_portfolio_aggressive(market_data)
                     
                     timestamp = datetime.now().strftime("%H:%M:%S")
                     
-                    # C. Log Results (Even if Empty)
-                    if not decisions:
-                        status.write("AI found no lucrative trades.")
-                        st.session_state["log_history"].insert(0, {
-                            "Time": timestamp,
-                            "Action": "SCAN",
-                            "Details": f"Scanned {len(batch)} assets. No opportunities found."
-                        })
-                    else:
-                        status.write(f"AI found {len(decisions)} opportunities!")
+                    if decisions:
+                        status.write(f"AI identified {len(decisions)} trades!")
                         
                         for dec in decisions:
                             asset = dec.get('asset')
@@ -244,30 +218,35 @@ if headers:
                             conf = dec.get('confidence', 0)
                             reason = dec.get('reason', '-')
                             
-                            # Log Trade
+                            # Log
                             st.session_state["log_history"].insert(0, {
                                 "Time": timestamp,
                                 "Action": f"{action} ({conf}%)",
-                                "Details": f"{asset}: {reason}"
+                                "Asset": asset,
+                                "Reason": reason
                             })
                             
-                            # Execute
-                            if action in ["BUY", "SELL"] and conf > 70:
+                            # C. LOW THRESHOLD EXECUTION (Conf > 40 is enough)
+                            if action in ["BUY", "SELL"] and conf > 40:
                                 if avail > 100:
-                                    size = 0.01 if "BTC" in asset else 1
+                                    # Aggressive Sizing
+                                    size = 0.02 if "BTC" in asset else 2
                                     execute_trade(headers, asset, action, size)
-                                    st.toast(f"✅ Executed: {action} {asset}")
-                                    time.sleep(0.5)
+                                    st.toast(f"💣 OPENED: {action} {asset}")
+                                    time.sleep(0.2) # Fast fire
                             else:
-                                status.write(f"Skipped {asset} (Conf {conf}% is too low)")
+                                status.write(f"Skipped {asset} (Conf {conf}% < 40%)")
+                                
+                        # Trim Log
+                        if len(st.session_state["log_history"]) > 20: 
+                            st.session_state["log_history"] = st.session_state["log_history"][:20]
+                    else:
+                        status.write("AI failed to pick trades (Rare).")
 
-                    # Trim Log
-                    if len(st.session_state["log_history"]) > 20: 
-                        st.session_state["log_history"] = st.session_state["log_history"][:20]
-
-            # D. Cooldown (60s)
-            for s in range(60, 0, -1):
-                status_box.info(f"⏳ Next Scan in {s}s")
+            # D. SHORT COOLDOWN (30s)
+            # Faster than 60s, risking rate limits for aggression
+            for s in range(30, 0, -1):
+                status_box.info(f"🔥 reloading... {s}s")
                 time.sleep(1)
             
             st.rerun()
