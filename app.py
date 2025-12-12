@@ -21,7 +21,7 @@ class CapitalClient:
             # --- GEMINI SETUP ---
             genai.configure(api_key=st.secrets["gemini"]["GEMINI_API_KEY"])
             
-            # 1. Try Specific Flash Models
+            # Auto-select best model (Prioritizing 2.5 Flash)
             self.model_name = self._select_best_model()
             self.model = genai.GenerativeModel(self.model_name)
             
@@ -35,31 +35,13 @@ class CapitalClient:
         self.x_security = None
 
     def _select_best_model(self):
-        """Prioritizes Flash models for speed."""
         try:
-            # Get list of available models for this API key
             available = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-            
-            # Priority List
-            priorities = [
-                'models/gemini-1.5-flash',
-                'models/gemini-2.0-flash-exp',
-                'models/gemini-pro',
-                'models/gemini-1.0-pro'
-            ]
-            
-            # Match priority against available
+            priorities = ['models/gemini-2.5-flash', 'models/gemini-2.0-flash', 'models/gemini-1.5-flash']
             for p in priorities:
                 if p in available: return p
-                
-            # If explicit match fails, find any flash
-            for m in available:
-                if 'flash' in m: return m
-                
-            # Last resort
-            return available[0]
+            return "gemini-1.5-flash" # Fallback
         except:
-            # If listing fails, force standard flash
             return "gemini-1.5-flash"
 
     def _encrypt_password(self, key_b64, timestamp):
@@ -74,9 +56,7 @@ class CapitalClient:
     def connect(self):
         try:
             r = self.session.get(f"{self.base_url}/api/v1/session/encryptionKey", headers={'X-CAP-API-KEY': self.cap_key})
-            if r.status_code == 401:
-                st.error("❌ Capital API Key Rejected.")
-                return False
+            if r.status_code == 401: return False
             r.raise_for_status()
             data = r.json()
             
@@ -90,8 +70,7 @@ class CapitalClient:
                 self.x_security = r.headers.get('X-SECURITY-TOKEN')
                 return True
             return False
-        except Exception as e:
-            st.error(f"Login Error: {e}")
+        except:
             return False
 
     def get_market_data(self, epic="ETHUSD"):
@@ -102,19 +81,15 @@ class CapitalClient:
         candles = []
 
         try:
-            # Price
             r = self.session.get(f"{self.base_url}/api/v1/markets/{epic}", headers=headers)
             if r.status_code == 200: price = r.json()['snapshot']['offer']
             
-            # Account
             r = self.session.get(f"{self.base_url}/api/v1/accounts", headers=headers)
             if r.status_code == 200: account = r.json()['accounts'][0]['balance']
             
-            # Positions
             r = self.session.get(f"{self.base_url}/api/v1/positions", headers=headers)
             if r.status_code == 200: positions = r.json()['positions']
 
-            # History
             r = self.session.get(f"{self.base_url}/api/v1/prices/{epic}?resolution=MINUTE&max=10", headers=headers)
             if r.status_code == 200: 
                 raw = r.json()['prices']
@@ -137,7 +112,7 @@ class CapitalClient:
                 self.session.delete(f"{self.base_url}/api/v1/positions/{p['dealId']}", headers=headers)
 
 # ==========================================
-# 2. AI MANAGER (AGGRESSIVE)
+# 2. AI MANAGER
 # ==========================================
 def ask_gemini_aggressive(bot, price, candles):
     if not candles or len(candles) < 3:
@@ -174,8 +149,7 @@ def ask_gemini_aggressive(bot, price, candles):
             return decision.strip().upper(), reason.strip()
         return "MICRO BUY", "Aggressive Default" 
     except Exception as e:
-        # Better Error Reporting
-        return "HOLD", f"API Error: {str(e)[:40]}"
+        return "HOLD", f"API Error: {str(e)}"
 
 # ==========================================
 # 3. DYNAMIC SIZING
@@ -224,9 +198,11 @@ def main():
         st.session_state.last_ai_check = datetime.now() - timedelta(minutes=5) 
         st.session_state.ai_log = []
         st.session_state.midnight_mode = False
+        st.session_state.cooldown_until = None # NEW: Backoff timer
 
     bot = st.session_state.bot
 
+    # --- SIDEBAR ---
     with st.sidebar:
         st.title("⚡ Scalper Admin")
         st.caption(f"🧠 Brain: {bot.model_name}")
@@ -254,6 +230,7 @@ def main():
                 bot.close_all_positions()
                 st.toast("Dumped all positions.")
 
+    # --- DASHBOARD ---
     st.title("🤖 AI High-Frequency Scalper")
     
     if not st.session_state.connected:
@@ -270,6 +247,7 @@ def main():
         st.subheader("🧠 Neural Feed")
         log_ph = st.empty()
 
+    # --- LOOP ---
     while True:
         price, account, positions, candles = bot.get_market_data("ETHUSD")
         
@@ -282,34 +260,46 @@ def main():
         safe_to_trade = available > reserve_floor
         
         now = datetime.now()
+        
+        # 1. Check if we are in a forced cooldown (from 429 error)
+        in_cooldown = st.session_state.cooldown_until and now < st.session_state.cooldown_until
+        
+        # 2. Check time since last AI call (Standard Rate Limit: 30s)
         time_since = (now - st.session_state.last_ai_check).total_seconds()
         
-        if st.session_state.active:
-            if time_since > 15:
+        if st.session_state.active and not in_cooldown:
+            if time_since > 30: # INCREASED TO 30s to prevent 429 errors
                 if safe_to_trade:
                     if len(positions) < 5: 
                         decision, reason = ask_gemini_aggressive(bot, price, candles)
                         
-                        timestamp = now.strftime('%H:%M:%S')
-                        log_entry = f"[{timestamp}] {decision}: {reason}"
-                        st.session_state.ai_log.insert(0, log_entry)
-                        st.session_state.last_ai_check = now
-                        
-                        if "BUY" in decision or "SELL" in decision:
-                            side = "BUY" if "BUY" in decision else "SELL"
-                            size = calculate_trade_size(decision, equity, price)
+                        # --- ERROR HANDLING ---
+                        if "429" in reason:
+                            st.session_state.cooldown_until = now + timedelta(seconds=60) # Wait 60s
+                            st.session_state.ai_log.insert(0, f"[{now.strftime('%H:%M:%S')}] ⚠️ Rate Limit! Pausing AI for 60s...")
+                        else:
+                            # Normal Execution
+                            timestamp = now.strftime('%H:%M:%S')
+                            log_entry = f"[{timestamp}] {decision}: {reason}"
+                            st.session_state.ai_log.insert(0, log_entry)
+                            st.session_state.last_ai_check = now
                             
-                            if size > 0:
-                                success, msg = bot.place_order("ETHUSD", side, size)
-                                if success:
-                                    st.toast(f"⚡ {decision} {size} ETH", icon="🔥")
-                                else:
-                                    st.session_state.ai_log.insert(0, f"[{timestamp}] EXEC FAIL: {msg}")
+                            if "BUY" in decision or "SELL" in decision:
+                                side = "BUY" if "BUY" in decision else "SELL"
+                                size = calculate_trade_size(decision, equity, price)
+                                
+                                if size > 0:
+                                    success, msg = bot.place_order("ETHUSD", side, size)
+                                    if success:
+                                        st.toast(f"⚡ {decision} {size} ETH", icon="🔥")
+                                    else:
+                                        st.session_state.ai_log.insert(0, f"[{timestamp}] EXEC FAIL: {msg}")
                     else:
                         st.session_state.ai_log.insert(0, f"[{now.strftime('%H:%M:%S')}] MAX POSITIONS (5). Holding.")
                 else:
                     st.session_state.ai_log.insert(0, "⚠️ LOW CASH RESERVE - Pausing Buys")
 
+        # --- UI UPDATE ---
         with header_ph.container():
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("Equity", f"€{equity:,.2f}")
