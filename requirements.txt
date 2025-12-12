@@ -1,6 +1,6 @@
 streamlit
 requests
-pycryptodome
+websocket-client
 pandas
-plotly
-google-generativeai
+numpy
+python-dotenv
