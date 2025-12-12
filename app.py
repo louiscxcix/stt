@@ -3,212 +3,226 @@ import requests
 import pandas as pd
 import google.generativeai as genai
 import time
-import json
+from datetime import datetime
+import pytz
 
-# --- CONFIGURATION & SETUP ---
-st.set_page_config(page_title="Aggressive Auto-Trader", layout="wide")
+# --- CONFIGURATION ---
+st.set_page_config(page_title="Aggressive AI Trader", layout="wide", page_icon="⚡")
 
-# 1. API CONFIGURATION (Load from st.secrets)
-try:
-    CAPITAL_API_KEY = st.secrets["capital_com"]["api_key"]
-    CAPITAL_EMAIL = st.secrets["capital_com"]["email"]
-    CAPITAL_PASSWORD = st.secrets["capital_com"]["password"]
-    GEMINI_API_KEY = st.secrets["gemini"]["GEMINI_API_KEY"]
-except FileNotFoundError:
-    st.error("Secrets file not found. Please set up .streamlit/secrets.toml")
-    st.stop()
+# 1. API CONFIGURATION
+# ---------------------------------------------------------
+# WARNING: CHANGE TO 'https://api-capital.backend-capital.com' FOR LIVE TRADING
+BASE_URL = "https://demo-api-capital.backend-capital.com" 
+# ---------------------------------------------------------
 
-# Configure Gemini
-genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel('gemini-pro')
-
-# Capital.com API Endpoints (Using DEMO for safety - Change to 'api-capital' for live)
-# BASE_URL = "https://api-capital.backend-capital.com" # LIVE
-BASE_URL = "https://demo-api-capital.backend-capital.com" # DEMO
 SESSION_URL = f"{BASE_URL}/api/v1/session"
 ACCOUNTS_URL = f"{BASE_URL}/api/v1/accounts"
 POSITIONS_URL = f"{BASE_URL}/api/v1/positions"
-MARKET_URL = f"{BASE_URL}/api/v1/markets"
+MARKETS_URL = f"{BASE_URL}/api/v1/markets"
 
-# --- HELPER FUNCTIONS ---
+# DIVERSIFIED PORTFOLIO WATCHLIST (Epics)
+# Mix of Crypto, Forex, Commodities, Stocks to spread risk
+WATCHLIST = ["BTCUSD", "ETHUSD", "EURUSD", "GBPUSD", "GOLD", "OIL_CRUDE", "US500", "AAPL"]
 
-def get_capital_session():
-    """Authenticates and returns session headers (CST, X-SECURITY-TOKEN)."""
-    headers = {
-        "X-CAP-API-KEY": CAPITAL_API_KEY,
-        "Content-Type": "application/json"
-    }
-    data = {
-        "identifier": CAPITAL_EMAIL,
-        "password": CAPITAL_PASSWORD
-    }
-    
+# SECRETS LOADING
+try:
+    CAP_API_KEY = st.secrets["capital_com"]["api_key"]
+    CAP_EMAIL = st.secrets["capital_com"]["email"]
+    CAP_PASSWORD = st.secrets["capital_com"]["password"]
+    GEMINI_KEY = st.secrets["gemini"]["GEMINI_API_KEY"]
+except:
+    st.error("❌ Secrets not found. Please create .streamlit/secrets.toml")
+    st.stop()
+
+# SETUP AI
+genai.configure(api_key=GEMINI_KEY)
+model = genai.GenerativeModel('gemini-pro')
+
+# --- CORE FUNCTIONS ---
+
+def get_session():
+    """Authenticates and returns headers."""
+    headers = {"X-CAP-API-KEY": CAP_API_KEY, "Content-Type": "application/json"}
+    data = {"identifier": CAP_EMAIL, "password": CAP_PASSWORD}
     try:
-        response = requests.post(SESSION_URL, json=data, headers=headers)
-        if response.status_code == 200:
-            cst = response.headers.get("CST")
-            x_sec = response.headers.get("X-SECURITY-TOKEN")
-            return {"CST": cst, "X-SECURITY-TOKEN": x_sec}
-        else:
-            st.error(f"Login Failed: {response.text}")
-            return None
+        resp = requests.post(SESSION_URL, json=data, headers=headers)
+        if resp.status_code == 200:
+            return {
+                "CST": resp.headers["CST"],
+                "X-SECURITY-TOKEN": resp.headers["X-SECURITY-TOKEN"],
+                "X-CAP-API-KEY": CAP_API_KEY,
+                "Content-Type": "application/json"
+            }
     except Exception as e:
-        st.error(f"Connection Error: {e}")
-        return None
-
-def get_account_data(auth_headers):
-    """Fetches equity, margin, and available funds."""
-    response = requests.get(ACCOUNTS_URL, headers=auth_headers)
-    if response.status_code == 200:
-        return response.json()
+        st.error(f"Auth Error: {e}")
     return None
 
-def get_open_positions(auth_headers):
-    """Fetches current open trades."""
-    response = requests.get(POSITIONS_URL, headers=auth_headers)
-    if response.status_code == 200:
-        return response.json()['positions']
+def get_account(headers):
+    resp = requests.get(ACCOUNTS_URL, headers=headers)
+    if resp.status_code == 200:
+        return resp.json()['accounts'][0]['balance']
+    return None
+
+def get_positions(headers):
+    resp = requests.get(POSITIONS_URL, headers=headers)
+    if resp.status_code == 200:
+        return resp.json()['positions']
     return []
 
-def get_market_price(auth_headers, epic="BTCUSD"):
-    """Fetches current price for a target asset (e.g., Bitcoin)."""
-    # Note: Using a specific epic for micro-trading example
-    url = f"{MARKET_URL}/{epic}"
-    response = requests.get(url, headers=auth_headers)
-    if response.status_code == 200:
-        return response.json()
-    return None
+def close_all_positions(headers, positions):
+    """Emergency close function for 23:59 rule."""
+    st.warning("⏰ MIDNIGHT PROTOCOL: Closing ALL positions.")
+    for p in positions:
+        deal_id = p['dealId']
+        requests.delete(f"{POSITIONS_URL}/{deal_id}", headers=headers)
+        time.sleep(0.2)
 
-def ai_strategy_decision(market_data, account_data, positions):
+def execute_trade(headers, epic, direction, size):
+    """Executes a trade on Capital.com"""
+    payload = {
+        "epic": epic,
+        "direction": direction, # "BUY" or "SELL"
+        "size": size,
+        "guaranteedStop": False,
+        "trailingStop": False
+    }
+    resp = requests.post(POSITIONS_URL, json=payload, headers=headers)
+    return resp.json()
+
+def ai_decision(epic, price, change, equity, available):
     """
-    Aggressive Strategy: Uses Gemini to decide BUY/SELL/HOLD based on data.
+    Asks Gemini for AGGRESSIVE micro-trading decision.
     """
-    
-    # Construct a prompt for Gemini
-    current_equity = account_data['accounts'][0]['balance']['equity']
-    available_funds = account_data['accounts'][0]['balance']['available']
-    
     prompt = f"""
-    You are a high-frequency, aggressive trading bot. 
-    Goal: Maximize profit using up to 80% of available funds.
-    
+    Role: Aggressive High-Frequency Trading Bot.
     Context:
-    - Asset: {market_data.get('instrument', {}).get('name', 'Unknown')}
-    - Current Bid: {market_data.get('snapshot', {}).get('bid')}
-    - Current Ask: {market_data.get('snapshot', {}).get('offer')}
-    - Price Change %: {market_data.get('snapshot', {}).get('dailyChange')}
-    - Total Equity: {current_equity}
-    - Available Funds: {available_funds}
-    - Current Open Positions Count: {len(positions)}
+    - Asset: {epic}
+    - Price: {price}
+    - Day Change: {change}%
+    - Account Equity: {equity}
+    - Funds Available: {available}
     
-    Task:
-    Analyze the data. If the price direction looks strong, recommend an aggressive entry.
-    If we are losing money on open positions, recommend a quick close.
+    Strategy:
+    - We want to maximize profit. 
+    - Be aggressive. 
+    - If trend is strong, ENTER.
     
-    Response Format (JSON only):
+    Output JSON ONLY:
     {{
-        "decision": "BUY" or "SELL" or "HOLD" or "CLOSE_ALL",
-        "reasoning": "Short explanation (max 1 sentence)",
-        "confidence": "0-100"
+        "action": "BUY" or "SELL" or "WAIT",
+        "confidence": 0-100,
+        "leverage_hint": "high"
     }}
     """
-    
     try:
-        response = model.generate_content(prompt)
-        # Clean up code blocks if Gemini adds them
-        text = response.text.replace('```json', '').replace('```', '')
+        resp = model.generate_content(prompt)
+        text = resp.text.replace("```json", "").replace("```", "").strip()
+        import json
         return json.loads(text)
-    except Exception as e:
-        return {"decision": "HOLD", "reasoning": f"AI Error: {e}", "confidence": 0}
+    except:
+        return {"action": "WAIT", "confidence": 0}
 
-# --- MAIN UI LAYOUT ---
+# --- MAIN UI & LOOP ---
 
-st.title("🤖 AI Algo-Trader (Capital.com)")
+st.title("⚡ Aggressive Auto-Trader (Midnight Protocol)")
 
-# Sidebar for controls
+# UI Containers
+dash_placeholder = st.empty()
+log_placeholder = st.empty()
+pos_placeholder = st.empty()
+
+# Sidebar Control
 with st.sidebar:
-    st.header("Settings")
-    target_asset = st.text_input("Target Asset (Epic)", "BTCUSD")
-    trade_mode = st.radio("Trading Mode", ["Paper (Simulation)", "Live (DANGEROUS)"])
-    if trade_mode == "Live (DANGEROUS)":
-        st.warning("You are in LIVE mode. Real money will be used.")
+    st.header("Control Panel")
+    run_bot = st.toggle("ACTIVATE BOT", value=False)
+    st.caption("While active, bot runs in loop. Do not close tab.")
+
+if "headers" not in st.session_state:
+    st.session_state["headers"] = get_session()
+
+headers = st.session_state["headers"]
+
+# --- THE BOT LOOP ---
+if run_bot and headers:
     
-    if st.button("Connect & Refresh"):
-        st.session_state['refresh'] = True
+    while True:
+        # 1. TIME CHECK (Midnight Protocol)
+        # Using UTC for consistency, adjust pytz.timezone if needed
+        now = datetime.now(pytz.utc)
+        current_time_str = now.strftime("%H:%M:%S")
+        
+        # Fetch Data
+        acct = get_account(headers)
+        positions = get_positions(headers)
+        
+        # UPDATE DASHBOARD
+        with dash_placeholder.container():
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Equity", f"${acct['equity']:.2f}")
+            c2.metric("Avail. Margin", f"${acct['available']:.2f}")
+            c3.metric("P&L", f"${acct['profitLoss']:.2f}", delta_color="normal")
+            c4.metric("Status", "RUNNING", f"Time: {current_time_str}")
 
-# Main Logic
-if 'auth_headers' not in st.session_state:
-    with st.spinner("Authenticating with Capital.com..."):
-        headers = get_capital_session()
-        if headers:
-            st.session_state['auth_headers'] = headers
-            st.success("Connected!")
-        else:
-            st.stop()
+        # UPDATE POSITIONS TABLE
+        with pos_placeholder.container():
+            if positions:
+                df = pd.DataFrame(positions)
+                st.dataframe(df[['epic', 'direction', 'size', 'openPrice', 'profitAndLoss']], use_container_width=True)
+            else:
+                st.info("No Open Trades")
 
-headers = st.session_state['auth_headers']
+        # LOGIC 1: MIDNIGHT CLOSE
+        # Triggers if time is 23:59 (UTC)
+        if now.hour == 23 and now.minute >= 59:
+            if positions:
+                close_all_positions(headers, positions)
+                log_placeholder.error("🛑 MIDNIGHT: All trades closed.")
+            else:
+                log_placeholder.info("🌙 Midnight: Sleeping until reset.")
+            time.sleep(60)
+            continue
 
-# 1. Dashboard (Top)
-col1, col2, col3, col4 = st.columns(4)
-acct_raw = get_account_data(headers)
+        # LOGIC 2: AGGRESSIVE ENTRY
+        # Only enter if we are using less than 80% of funds
+        equity = acct['equity']
+        used_margin = acct['margin']
+        utilization = used_margin / equity if equity > 0 else 1.0
 
-if acct_raw:
-    acct = acct_raw['accounts'][0]['balance']
-    col1.metric("Equity", f"${acct['equity']:.2f}")
-    col2.metric("Available Margin", f"${acct['available']:.2f}")
-    col3.metric("Total P&L", f"${acct['profitLoss']:.2f}", delta_color="normal")
-    col4.metric("Used Margin", f"{acct['margin']:.2f}")
+        if utilization < 0.80:
+            # Pick a random asset from watchlist to analyze (to avoid rate limits on scanning all at once)
+            import random
+            target = random.choice(WATCHLIST)
+            
+            # Get Market Price
+            mkt_req = requests.get(f"{MARKETS_URL}/{target}", headers=headers)
+            if mkt_req.status_code == 200:
+                data = mkt_req.json()
+                snapshot = data['snapshot']
+                price = snapshot['offer']
+                change = snapshot['dailyChange']
 
-    st.markdown("---")
-
-    # 2. AI & Market Data
-    market_raw = get_market_price(headers, target_asset)
-    positions = get_open_positions(headers)
-    
-    col_ai, col_mkt = st.columns([2, 1])
-    
-    with col_mkt:
-        st.subheader("Market Data")
-        if market_raw:
-            snapshot = market_raw.get('snapshot', {})
-            st.write(f"**Asset:** {target_asset}")
-            st.write(f"**Bid:** {snapshot.get('bid')}")
-            st.write(f"**Ask:** {snapshot.get('offer')}")
-            st.write(f"**Change:** {snapshot.get('dailyChange')}%")
-        else:
-            st.error("Market closed or invalid Epic.")
-
-    with col_ai:
-        st.subheader("AI Strategy Log")
-        if st.button("RUN AI ANALYSIS NOW"):
-            with st.spinner("Gemini is analyzing market structure..."):
-                decision = ai_strategy_decision(market_raw, acct_raw, positions)
+                # Ask AI
+                decision = ai_decision(target, price, change, equity, acct['available'])
                 
-                st.info(f"**Decision:** {decision['decision']}")
-                st.write(f"**Reasoning:** {decision['reasoning']}")
-                st.progress(int(decision['confidence']))
-                
-                # EXECUTION LOGIC (Stubbed for safety)
-                if decision['decision'] in ["BUY", "SELL"] and int(decision['confidence']) > 70:
-                    st.write(f"🚀 **Action Triggered:** Attempting to {decision['decision']} {target_asset}")
-                    if trade_mode == "Live (DANGEROUS)":
-                        # Actual API call to place trade would go here
-                        # requests.post(f"{BASE_URL}/api/v1/positions", ...)
-                        st.error("Live execution paused for safety in this template.")
-                    else:
-                        st.success("Paper Trade Simulated Successfully.")
+                with log_placeholder.container():
+                    st.write(f"🤖 **AI Analysis on {target}:** {decision['action']} (Conf: {decision['confidence']}%)")
 
-    st.markdown("---")
+                # EXECUTE
+                if decision['action'] in ["BUY", "SELL"] and decision['confidence'] > 75:
+                    # Size calculation: 5% of available margin per trade to allow diversification
+                    # Note: Capital.com requires minimum sizes, this is a simplified calculation
+                    # You might need to adjust 'size' based on specific asset minimums (e.g. 0.01 for BTC)
+                    trade_size = 0.01 if "BTC" in target else 1 
+                    
+                    st.toast(f"🚀 Executing {decision['action']} on {target}")
+                    execute_trade(headers, target, decision['action'], trade_size)
+                    time.sleep(2) # Cooldown to prevent API spam
+        else:
+            log_placeholder.warning("⚠️ Max Margin (80%) Reached. Holding positions.")
 
-    # 3. Open Positions Table
-    st.subheader("Aggressive Positions (Open)")
-    if positions:
-        df = pd.DataFrame(positions)
-        # Select relevant columns for display
-        display_df = df[['dealId', 'epic', 'direction', 'openPrice', 'size', 'profitAndLoss']]
-        st.dataframe(display_df, use_container_width=True)
-    else:
-        st.write("No open positions. AI is waiting for entry.")
+        # Loop delay
+        time.sleep(5) 
+        st.rerun()
 
-else:
-    st.error("Failed to fetch account data. Please check your token expiration.")
+elif not run_bot:
+    st.info("Bot is deactivated. Toggle sidebar to start.")
