@@ -6,12 +6,13 @@ import time
 from datetime import datetime
 import json
 import random
+import re
 
 # --- CONFIGURATION ---
 st.set_page_config(page_title="AI Portfolio Architect", layout="wide", page_icon="🏗️")
 
 # API ENDPOINTS
-BASE_URL = "https://demo-api-capital.backend-capital.com" 
+BASE_URL = "[https://demo-api-capital.backend-capital.com](https://demo-api-capital.backend-capital.com)" 
 SESSION_URL = f"{BASE_URL}/api/v1/session"
 ACCOUNTS_URL = f"{BASE_URL}/api/v1/accounts"
 POSITIONS_URL = f"{BASE_URL}/api/v1/positions"
@@ -42,9 +43,27 @@ model = genai.GenerativeModel('gemini-2.5-flash-lite')
 # --- STATE ---
 if "log_history" not in st.session_state: st.session_state["log_history"] = []
 if "headers" not in st.session_state: st.session_state["headers"] = None
-if "last_allocation" not in st.session_state: st.session_state["last_allocation"] = None
+if "last_plan_debug" not in st.session_state: st.session_state["last_plan_debug"] = "Waiting..."
 
-# --- FUNCTIONS ---
+# --- HELPER: JSON CLEANER ---
+def clean_and_parse_json(raw_text):
+    """
+    Robustly cleans AI response to ensure valid JSON.
+    """
+    try:
+        # 1. Remove Markdown code blocks
+        text = re.sub(r"```json\s*", "", raw_text)
+        text = re.sub(r"```", "", text)
+        text = text.strip()
+        
+        # 2. Try parse
+        return json.loads(text)
+    except json.JSONDecodeError:
+        # 3. If fail, return empty list and log error
+        st.session_state["last_plan_debug"] = f"JSON PARSE ERROR:\n{raw_text}"
+        return []
+
+# --- API FUNCTIONS ---
 
 def get_session():
     headers = {"X-CAP-API-KEY": CAP_API_KEY, "Content-Type": "application/json"}
@@ -100,132 +119,141 @@ def fetch_market_batch(headers, assets):
         except: pass
     return batch_data
 
-# --- AI BRAINS ---
+# --- AI LOGIC ---
 
 def ai_smart_allocate(total_funds, market_data):
-    """
-    Takes a $ amount and market data.
-    Returns a portfolio allocation plan.
-    """
+    # Simplified data for AI context
     data_str = json.dumps(market_data, indent=2)
+    
     prompt = f"""
-    You are a Portfolio Manager.
-    I have ${total_funds} to invest right now.
-    Live Market Data: {data_str}
+    You are a Portfolio Manager. 
+    Funds: ${total_funds}.
+    Market Data: {data_str}
     
     TASK:
-    1. Select the BEST 3-5 assets based on momentum/volatility.
-    2. Allocate the ${total_funds} across them.
-    3. Calculate the trade size for each (Assume leverage 1:1 for simplicity, Volume = Funds / Price).
-    4. Be aggressive but diversified.
+    1. Identify the 3 best assets based on momentum.
+    2. Create a diversified allocation plan.
+    3. Return strictly valid JSON.
     
-    RESPONSE JSON LIST:
+    EXAMPLE RESPONSE:
     [
-        {{"asset": "BTCUSD", "direction": "BUY", "usd_amount": 300, "reason": "Breakout"}},
-        {{"asset": "TSLA", "direction": "SELL", "usd_amount": 200, "reason": "Overbought"}}
+        {{"asset": "BTCUSD", "direction": "BUY", "usd_amount": 300, "reason": "High Volatility"}},
+        {{"asset": "GOLD", "direction": "SELL", "usd_amount": 200, "reason": "Dropping"}}
     ]
     """
     try:
         response = model.generate_content(prompt)
-        text = response.text.replace("```json", "").replace("```", "").strip()
-        st.session_state["last_allocation"] = text
-        return json.loads(text)
-    except: return []
+        # Store raw text for debugging if it fails
+        st.session_state["last_plan_debug"] = response.text 
+        return clean_and_parse_json(response.text)
+    except Exception as e:
+        st.session_state["last_plan_debug"] = str(e)
+        return []
 
 def analyze_portfolio_aggressive(market_data_list):
-    """Brain 2: Auto-Scalper"""
     data_str = json.dumps(market_data_list, indent=2)
     prompt = f"""
-    Role: Degenerate Scalper.
+    Role: High-Frequency Scalper.
     Data: {data_str}
-    Task: Pick top 3 assets. Return JSON: [{{"asset": "BTCUSD", "action": "BUY", "confidence": 90, "reason": "Pump"}}, ...]
+    Task: Pick 3 trades. Ignore safety.
+    Return JSON: [{{"asset": "BTCUSD", "action": "BUY", "confidence": 90, "reason": "Pump"}}, ...]
     """
     try:
         response = model.generate_content(prompt)
-        text = response.text.replace("```json", "").replace("```", "").strip()
-        return json.loads(text)
+        return clean_and_parse_json(response.text)
     except: return []
 
 def manage_positions_ai(positions_data):
-    """Brain 3: Risk Manager"""
     if not positions_data: return []
-    # Simplified data for AI
-    summary = [{"id": p.get('dealId'), "asset": p.get('epic'), "pnl": p.get('profitAndLoss')} for p in positions_data]
-    data_str = json.dumps(summary, indent=2)
     
+    # Safe summary builder
+    summary = []
+    for p in positions_data:
+        summary.append({
+            "id": p.get('dealId'), 
+            "asset": p.get('epic'), 
+            "pnl": p.get('profitAndLoss')
+        })
+
+    data_str = json.dumps(summary, indent=2)
     prompt = f"""
-    Risk Manager. Open Positions: {data_str}.
-    Task: CLOSE if PnL > 5 (Take Profit) or PnL < -15 (Stop Loss). HOLD otherwise.
+    Risk Manager. 
+    Positions: {data_str}.
+    
+    Rules:
+    - CLOSE if PnL > 1.0 (Take Profit).
+    - CLOSE if PnL < -5.0 (Stop Loss).
+    - Otherwise HOLD.
+    
     Return JSON: [{{"id": "123", "action": "CLOSE", "reason": "TP"}}, ...]
     """
     try:
         response = model.generate_content(prompt)
-        text = response.text.replace("```json", "").replace("```", "").strip()
-        return json.loads(text)
+        return clean_and_parse_json(response.text)
     except: return []
 
 # --- UI LAYOUT ---
 
 st.title(f"🏗️ AI Portfolio Architect")
 
-# Connect
+# Headers Init
 headers = st.session_state["headers"]
 if not headers:
     headers = get_session()
     st.session_state["headers"] = headers
 
-# --- SIDEBAR: SMART ALLOCATOR ---
+# --- SIDEBAR ---
 with st.sidebar:
     st.header("🧠 Smart Allocate")
-    st.caption("Let AI decide how to invest your money.")
-    
     with st.form("smart_alloc_form"):
-        invest_amount = st.number_input("Amount to Invest ($)", min_value=100, value=1000, step=100)
-        alloc_btn = st.form_submit_button("🚀 Build & Buy Portfolio")
+        invest_amount = st.number_input("Invest Amount ($)", 100, 10000, 1000)
+        alloc_btn = st.form_submit_button("🚀 Build Portfolio")
         
         if alloc_btn and headers:
-            st.info("Scanning markets...")
-            # 1. Fetch Batch
+            st.info("Scanning...")
             batch = random.sample(PORTFOLIO, 10)
             mkt_data = fetch_market_batch(headers, batch)
             
             if mkt_data:
-                # 2. Ask AI
                 plan = ai_smart_allocate(invest_amount, mkt_data)
                 
                 if plan:
-                    st.success(f"AI Selected {len(plan)} Assets!")
+                    st.success(f"Executing {len(plan)} trades!")
                     for item in plan:
                         asset = item.get('asset')
                         direction = item.get('direction')
                         usd = item.get('usd_amount')
-                        reason = item.get('reason')
                         
-                        # Crude size calc (Price is needed for exact size, approximating for Demo)
-                        # In real app, fetch current price again to divide usd/price
-                        size = 0.02 if "BTC" in asset else 1.0 
-                        if "Stocks" in asset: size = 1
+                        # Dynamic Sizing (Approximate)
+                        size = 0.02 if "BTC" in asset else 1.0
                         
                         res = execute_trade(headers, asset, direction, size)
                         if res.status_code == 200:
                             st.toast(f"✅ Bought ${usd} of {asset}")
                         else:
-                            st.error(f"Failed {asset}")
-                        time.sleep(0.2)
+                            st.error(f"Failed {asset}: {res.text}")
+                        time.sleep(0.3)
+                    time.sleep(1)
                     st.rerun()
                 else:
-                    st.error("AI couldn't build a plan.")
+                    st.error("AI returned invalid plan.")
+                    with st.expander("See Raw AI Error"):
+                        st.code(st.session_state["last_plan_debug"])
+            else:
+                st.error("Could not fetch market data.")
 
     st.divider()
-    
     st.header("🤖 Auto-Scalper")
     run_bot = st.toggle("ACTIVATE SCALPER", key="run_bot")
     if st.button("Reconnect"):
         st.session_state["headers"] = get_session()
         st.rerun()
 
+# --- MAIN DASHBOARD ---
 if headers:
     acct = get_account_safe(headers)
+    
+    # Auto-Reauth
     if acct == "UNAUTHORIZED":
         st.session_state["headers"] = get_session()
         st.rerun()
@@ -234,63 +262,67 @@ if headers:
         # 1. METRICS
         equity = acct.get('equity', 0)
         avail = acct.get('available', 0)
+        pnl = acct.get('profitLoss', 0)
         positions = get_positions(headers)
 
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Equity", f"${equity:,.0f}")
         m2.metric("Available", f"${avail:,.0f}")
-        m3.metric("P&L", f"${acct.get('profitLoss', 0):,.2f}")
+        m3.metric("P&L", f"${pnl:,.2f}", delta=pnl)
         m4.metric("Open Trades", len(positions))
         
         st.divider()
 
-        # 2. ACTIVE POSITIONS (FIXED CRASH)
+        # 2. ACTIVE POSITIONS (MANUAL BUILD - NO CRASH)
         st.subheader("⚔️ Active Positions")
         if positions:
-            df = pd.DataFrame(positions)
+            # We build the list manually to ensure keys exist
+            clean_positions = []
+            for p in positions:
+                clean_positions.append({
+                    "Symbol": p.get('epic', 'Unknown'),
+                    "Direction": p.get('direction', '-'),
+                    "Size": p.get('dealSize', 0),
+                    "Entry": p.get('openPrice', 0),
+                    "P&L": p.get('profitAndLoss', 0)
+                })
             
-            # --- KEY ERROR FIX ---
-            # We map the raw API keys to nice names. 
-            # If a key is missing, we fill it with 0 or "-".
-            safe_df = pd.DataFrame()
-            safe_df['Symbol'] = df.get('epic', '-')
-            safe_df['Direction'] = df.get('direction', '-')
-            safe_df['Size'] = df.get('size', df.get('dealSize', 0)) # Try both keys
-            safe_df['Entry'] = df.get('openPrice', df.get('level', 0))
-            safe_df['P&L'] = df.get('profitAndLoss', df.get('upl', 0))
-            
+            df = pd.DataFrame(clean_positions)
             st.dataframe(
-                safe_df, 
+                df, 
                 use_container_width=True,
-                column_config={"P&L": st.column_config.NumberColumn("P&L", format="$%.2f")}
+                column_config={
+                    "P&L": st.column_config.NumberColumn("P&L", format="$%.2f")
+                }
             )
         else:
             st.info("No trades currently open.")
 
-        # 3. LIVE LOGS
+        # 3. LOGS
         with st.expander("📜 Live Action Log", expanded=True):
             if st.session_state["log_history"]:
                 st.dataframe(pd.DataFrame(st.session_state["log_history"]), use_container_width=True, hide_index=True)
             else:
                 st.caption("Log empty...")
 
-        # --- MAIN LOOP ---
+        # --- EXECUTION LOOP ---
         if run_bot:
             status_box = st.empty()
             
-            # A. Manage Existing
+            # A. Manage Risk
             if positions:
                 with status_box.status("🛡️ Managing Risk...", expanded=True) as status:
                     decisions = manage_positions_ai(positions)
-                    for dec in decisions:
-                        if dec.get('action') == "CLOSE":
-                            deal_id = dec.get('id')
-                            close_position(headers, deal_id)
-                            st.toast(f"💰 Closed {deal_id}")
-                            st.session_state["log_history"].insert(0, {"Time": datetime.now().strftime("%H:%M:%S"), "Action": "CLOSE", "Reason": dec.get('reason')})
-                    status.write("Risk check done.")
+                    if decisions:
+                        for dec in decisions:
+                            if dec.get('action') == "CLOSE":
+                                deal_id = dec.get('id')
+                                close_position(headers, deal_id)
+                                st.toast(f"💰 Closed Trade {deal_id}")
+                                st.session_state["log_history"].insert(0, {"Time": datetime.now().strftime("%H:%M:%S"), "Action": "CLOSE", "Reason": dec.get('reason')})
+                    status.write("Risk Check Complete.")
 
-            # B. Hunt New
+            # B. Hunt Trades
             batch = random.sample(PORTFOLIO, 10)
             with status_box.status(f"⚡ Scalping 10 Assets...", expanded=True) as status:
                 market_data = fetch_market_batch(headers, batch)
@@ -314,7 +346,7 @@ if headers:
                                         "Asset": asset,
                                         "Reason": dec.get('reason')
                                     })
-                                    time.sleep(0.2)
+                                    time.sleep(0.3)
                     
                     if len(st.session_state["log_history"]) > 20: 
                         st.session_state["log_history"] = st.session_state["log_history"][:20]
