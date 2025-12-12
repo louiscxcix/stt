@@ -29,7 +29,7 @@ class CapitalClient:
                 self.model = genai.GenerativeModel(self.model_name)
             
         except Exception as e:
-            st.error(f"❌ Connection Error: {e}")
+            st.error(f"❌ Init Error: {e}")
             st.stop()
         
         self.base_url = "https://demo-api-capital.backend-capital.com"
@@ -65,23 +65,38 @@ class CapitalClient:
             return False
         except: return False
 
+    # --- ROBUST DATA FETCHING (Separated calls) ---
     def get_market_data(self, epic="ETHUSD"):
         headers = {'X-CAP-API-KEY': self.cap_key, 'CST': self.cst, 'X-SECURITY-TOKEN': self.x_security}
+        
         price = 0
         account = {}
         positions = []
         candles = []
 
+        # 1. Get Positions (CRITICAL)
+        try:
+            r = self.session.get(f"{self.base_url}/api/v1/positions", headers=headers)
+            if r.status_code == 200:
+                positions = r.json().get('positions', [])
+        except: pass
+
+        # 2. Get Account
+        try:
+            r = self.session.get(f"{self.base_url}/api/v1/accounts", headers=headers)
+            if r.status_code == 200:
+                account = r.json()['accounts'][0]['balance']
+        except: pass
+
+        # 3. Get Price
         try:
             r = self.session.get(f"{self.base_url}/api/v1/markets/{epic}", headers=headers)
-            if r.status_code == 200: price = r.json()['snapshot']['offer']
-            
-            r = self.session.get(f"{self.base_url}/api/v1/accounts", headers=headers)
-            if r.status_code == 200: account = r.json()['accounts'][0]['balance']
-            
-            r = self.session.get(f"{self.base_url}/api/v1/positions", headers=headers)
-            if r.status_code == 200: positions = r.json()['positions']
+            if r.status_code == 200:
+                price = r.json()['snapshot']['offer']
+        except: pass
 
+        # 4. Get History (For AI)
+        try:
             r = self.session.get(f"{self.base_url}/api/v1/prices/{epic}?resolution=MINUTE&max=5", headers=headers)
             if r.status_code == 200: 
                 raw = r.json()['prices']
@@ -104,7 +119,7 @@ class CapitalClient:
                 self.session.delete(f"{self.base_url}/api/v1/positions/{p['dealId']}", headers=headers)
 
 # ==========================================
-# 2. MANIC AI MANAGER (NO HOLDING ALLOWED)
+# 2. MANIC AI MANAGER
 # ==========================================
 def ask_gemini_aggressive(bot, price, candles):
     if not candles: return "MICRO BUY", "No Data - Force Entry"
@@ -133,7 +148,6 @@ def ask_gemini_aggressive(bot, price, candles):
         if "|" in text:
             decision, reason = text.split("|", 1)
             return decision.strip().upper(), reason.strip()
-        # Fallback if AI hallucinates format
         return "MICRO BUY", "AI Format Error - Defaulting to Buy"
     except Exception as e:
         return "MICRO BUY", f"API Fail - Force Buy: {str(e)[:10]}"
@@ -142,7 +156,7 @@ def ask_gemini_aggressive(bot, price, candles):
 # 3. DYNAMIC SIZING
 # ==========================================
 def calculate_trade_size(decision, equity, price):
-    if price == 0 or equity == 0: return 0.01 # Fail-safe small size
+    if price == 0 or equity == 0: return 0.01 
     
     core_fund = equity * 0.50
     micro_fund = equity * 0.30
@@ -209,7 +223,6 @@ def main():
             else:
                 if c1.button("▶️ START NOW"):
                     st.session_state.active = True
-                    # Reset triggers
                     st.session_state.last_ai_check = datetime.now() - timedelta(minutes=1)
                     st.rerun()
             
@@ -234,6 +247,7 @@ def main():
         log_ph = st.empty()
 
     while True:
+        # 1. Fetch Data (Resilient)
         price, account, positions, candles = bot.get_market_data("ETHUSD")
         
         equity = account.get('equity', 0)
@@ -241,19 +255,40 @@ def main():
         margin = account.get('margin', 0)
         pl = account.get('profitLoss', 0)
         
-        # We relaxed the reserve logic to ensure it TRADES.
-        # As long as we have $50, we trade.
+        # 2. Update UI (HEADER)
+        with header_ph.container():
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Equity", f"€{equity:,.2f}")
+            c2.metric("Free Funds", f"€{available:,.2f}")
+            c3.metric("Margin Used", f"€{margin:,.2f}")
+            c4.metric("Total P/L", f"€{pl:,.2f}", delta=pl)
+
+        # 3. Update UI (POSITIONS TABLE) - Always show real data
+        if positions:
+            trade_list = []
+            for p in positions:
+                val_pl = p.get('profitAndLoss', 0)
+                if val_pl is None: val_pl = 0
+                
+                trade_list.append({
+                    "Type": p.get('direction'),
+                    "Size": p.get('size'),
+                    "Entry": p.get('openPrice'),
+                    "P/L": f"€{val_pl:.2f}"
+                })
+            table_ph.dataframe(pd.DataFrame(trade_list), use_container_width=True)
+        else:
+            table_ph.info("No Open Trades found on Account.")
+
+        # 4. AI Logic
         safe_to_trade = available > 50
-        
         now = datetime.now()
         in_cooldown = st.session_state.cooldown_until and now < st.session_state.cooldown_until
         time_since = (now - st.session_state.last_ai_check).total_seconds()
         
         if st.session_state.active and not in_cooldown:
-            # 10 SECOND LOOP FOR SPEED
             if time_since > 10:
                 if safe_to_trade:
-                    # Only allow 3 concurrent trades max to prevent explosion
                     if len(positions) < 3: 
                         decision, reason = ask_gemini_aggressive(bot, price, candles)
                         
@@ -266,7 +301,6 @@ def main():
                             st.session_state.ai_log.insert(0, log_entry)
                             st.session_state.last_ai_check = now
                             
-                            # EXECUTE WITHOUT QUESTION
                             side = "BUY" if "BUY" in decision else "SELL"
                             size = calculate_trade_size(decision, equity, price)
                             
@@ -278,30 +312,9 @@ def main():
                                     st.session_state.ai_log.insert(0, f"[{timestamp}] EXEC FAIL: {msg}")
                     else:
                         st.session_state.ai_log.insert(0, f"[{now.strftime('%H:%M:%S')}] Max Positions (3). Waiting.")
-                        st.session_state.last_ai_check = now # Reset timer so we don't spam log
+                        st.session_state.last_ai_check = now
                 else:
                     st.error(f"LOW FUNDS: ${available} < $50")
-
-        # UI UPDATE
-        with header_ph.container():
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Equity", f"€{equity:,.2f}")
-            c2.metric("Free Funds", f"€{available:,.2f}")
-            c3.metric("Margin Used", f"€{margin:,.2f}")
-            c4.metric("Total P/L", f"€{pl:,.2f}", delta=pl)
-
-        if positions:
-            trade_list = []
-            for p in positions:
-                trade_list.append({
-                    "Type": p.get('direction'),
-                    "Size": p.get('size'),
-                    "Entry": p.get('openPrice'),
-                    "P/L": f"€{p.get('profitAndLoss'):.2f}"
-                })
-            table_ph.dataframe(pd.DataFrame(trade_list), use_container_width=True)
-        else:
-            table_ph.info("Scanning for setup...")
 
         with log_ph.container(height=400):
             for log in st.session_state.ai_log[:20]:
