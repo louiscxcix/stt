@@ -4,12 +4,11 @@ import pandas as pd
 import google.generativeai as genai
 import time
 from datetime import datetime
-import random
 import json
 import re
 
 # --- CONFIGURATION ---
-st.set_page_config(page_title="Hedge Fund AI Manager", layout="wide", page_icon="🏦")
+st.set_page_config(page_title="Portfolio AI Manager", layout="wide", page_icon="🏢")
 
 # API ENDPOINTS
 BASE_URL = "https://demo-api-capital.backend-capital.com" 
@@ -18,18 +17,13 @@ ACCOUNTS_URL = f"{BASE_URL}/api/v1/accounts"
 POSITIONS_URL = f"{BASE_URL}/api/v1/positions"
 MARKETS_URL = f"{BASE_URL}/api/v1/markets"
 
-# DIVERSIFIED PORTFOLIO (15+ Assets)
-FULL_PORTFOLIO = [
-    # Crypto
-    "BTCUSD", "ETHUSD", "XRPUSD",
-    # Forex
-    "EURUSD", "GBPUSD", "USDJPY",
-    # Commodities
-    "GOLD", "OIL_CRUDE", "NATURAL_GAS",
-    # Indices
-    "US500", "US30", "DE40",
-    # Tech Stocks
-    "TSLA", "NVDA", "AAPL"
+# MASSIVE PORTFOLIO (Analyzed in batches)
+PORTFOLIO = [
+    "BTCUSD", "ETHUSD", "XRPUSD", "LTCUSD",      # Crypto
+    "EURUSD", "GBPUSD", "USDJPY", "AUDUSD",      # Forex
+    "GOLD", "SILVER", "OIL_CRUDE", "NATURAL_GAS",# Commodities
+    "US500", "US30", "DE40", "JP225",            # Indices
+    "TSLA", "NVDA", "AAPL", "MSFT", "AMZN"       # Stocks
 ]
 
 # --- SECRETS ---
@@ -43,14 +37,12 @@ except:
     st.stop()
 
 genai.configure(api_key=GEMINI_KEY)
-# Using Flash Lite for speed/cost balance
-TARGET_MODEL_NAME = 'gemini-2.5-flash-lite'
-model = genai.GenerativeModel(TARGET_MODEL_NAME)
+# Flash Lite is perfect for large context windows (batching)
+model = genai.GenerativeModel('gemini-2.5-flash-lite')
 
 # --- STATE ---
 if "log_history" not in st.session_state: st.session_state["log_history"] = []
 if "headers" not in st.session_state: st.session_state["headers"] = None
-if "cycle_status" not in st.session_state: st.session_state["cycle_status"] = "Ready."
 
 # --- FUNCTIONS ---
 
@@ -88,49 +80,77 @@ def execute_trade(headers, epic, direction, size):
     payload = {"epic": epic, "direction": direction, "size": size, "guaranteedStop": False, "trailingStop": False}
     requests.post(POSITIONS_URL, json=payload, headers=headers)
 
-# --- 2-STEP AI LOGIC ---
-
-def generate_strategy_prompt(epic):
-    """Step 1: Get Strategy"""
-    meta_prompt = f"""
-    You are a hedge fund manager.
-    Create a 1-sentence aggressive strategy to trade {epic}.
-    Focus on current volatility.
+def fetch_market_batch(headers, assets):
     """
-    try:
-        response = model.generate_content(meta_prompt)
-        return response.text.strip()
-    except Exception as e:
-        if "429" in str(e): return "RATE_LIMIT"
-        return f"Analyze {epic} for immediate volatility."
+    Fetches price data for MULTIPLE assets at once to save time.
+    """
+    batch_data = []
+    for asset in assets:
+        try:
+            # Capital.com is fast, we can loop this quickly without hitting Gemini limits
+            resp = requests.get(f"{MARKETS_URL}/{asset}", headers=headers)
+            if resp.status_code == 200:
+                data = resp.json()
+                if 'snapshot' in data:
+                    s = data['snapshot']
+                    batch_data.append({
+                        "symbol": asset,
+                        "price": s.get('offer', 0),
+                        "change": s.get('dailyChange', 0),
+                        "high": s.get('high', 0),
+                        "low": s.get('low', 0)
+                    })
+        except: pass
+    return batch_data
 
-def analyze_market(strategy_instruction, price, change):
-    """Step 2: Get Decision"""
-    final_prompt = f"""
-    STRATEGY: {strategy_instruction}
-    DATA: Price {price} | Change {change}%
+def analyze_portfolio_batch(market_data_list):
+    """
+    SENDS ONE MASSIVE PROMPT TO GEMINI.
+    "Here is the data for 10 assets. Pick the top 3."
+    """
     
-    TASK: Decide BUY, SELL, or WAIT.
-    Maximize profit. Be aggressive.
+    # Convert list of dicts to a string table for the AI
+    data_str = json.dumps(market_data_list, indent=2)
     
-    JSON format: {{"action": "BUY"/"SELL"/"WAIT", "confidence": 0-100, "reason": "brief text"}}
+    prompt = f"""
+    You are a Senior Portfolio Manager.
+    Here is the live market data for our watchlist:
+    
+    {data_str}
+    
+    TASK:
+    1. Scan all assets.
+    2. Identify ONLY the "Lucrative" opportunities (Strong Buy or Strong Sell).
+    3. Ignore anything with weak momentum or low volatility.
+    4. Select a maximum of 3 trades.
+    
+    RESPONSE FORMAT (JSON LIST):
+    [
+        {{
+            "asset": "BTCUSD",
+            "action": "BUY",
+            "confidence": 85,
+            "reason": "Breakout above resistance with 2% volume spike"
+        }},
+        ...
+    ]
+    If no good trades, return an empty list [].
     """
     
     try:
-        response = model.generate_content(final_prompt)
+        response = model.generate_content(prompt)
         text = response.text.replace("```json", "").replace("```", "").strip()
         return json.loads(text)
     except Exception as e:
-        if "429" in str(e): return {"action": "RATE_LIMIT"}
-        return {"action": "WAIT", "reason": "Error"}
+        return []
 
 # --- UI LAYOUT ---
 
-st.title(f"🏦 Hedge Fund AI Manager")
+st.title(f"🏢 Portfolio AI Manager")
 
 with st.sidebar:
     st.header("Control")
-    run_bot = st.toggle("START PORTFOLIO SCANNER", key="run_bot")
+    run_bot = st.toggle("ACTIVATE FUND MANAGER", key="run_bot")
     if st.button("Reconnect"):
         st.session_state["headers"] = get_session()
         st.rerun()
@@ -160,7 +180,7 @@ if headers:
         
         st.divider()
 
-        # 2. POSITIONS (TOP PRIORITY)
+        # 2. POSITIONS (Top Priority)
         st.subheader("⚔️ Active Positions")
         if positions:
             df = pd.DataFrame(positions)
@@ -170,99 +190,90 @@ if headers:
                 column_config={"profitAndLoss": st.column_config.NumberColumn("P&L", format="$%.2f")}
             )
         else:
-            st.info("No trades open. Scanning portfolio...")
+            st.info("No trades open. Portfolio scanner active.")
 
         st.divider()
 
-        # 3. LIVE SESSION LOGS
-        st.subheader("📜 Live Session Log")
+        # 3. LIVE DECISION LOG (Table View)
+        st.subheader("📜 Portfolio Decisions")
         if st.session_state["log_history"]:
-            # Create a nice table from the history
             log_df = pd.DataFrame(st.session_state["log_history"])
+            
+            # Use Streamlit's new column config for progress bars
             st.dataframe(
                 log_df, 
                 use_container_width=True, 
                 hide_index=True,
                 column_config={
-                    "Conf": st.column_config.TextColumn("Conf", width="small"),
-                    "Action": st.column_config.TextColumn("Action", width="small"),
+                    "Conf": st.column_config.ProgressColumn(
+                        "AI Confidence",
+                        format="%d%%",
+                        min_value=0,
+                        max_value=100
+                    ),
+                    "Action": st.column_config.TextColumn("Action"),
+                    "Asset": st.column_config.TextColumn("Asset"),
                 }
             )
         else:
-            st.caption("Waiting for first scan batch...")
+            st.caption("Waiting for first batch analysis...")
 
         # --- EXECUTION LOOP ---
         if run_bot:
             status_box = st.empty()
             
-            # BATCH LOGIC: Select 5 random assets to scan this minute
-            # This prevents 429 Rate Limits (Quota)
-            batch = random.sample(FULL_PORTFOLIO, 5)
+            # BATCH LOGIC: Scan 8 assets at a time (Safe for 1 prompt)
+            import random
+            batch = random.sample(PORTFOLIO, 8) 
             
-            with status_box.status(f"⚡ Scanning Batch: {', '.join(batch)}", expanded=True) as status:
+            with status_box.status(f"⚡ Analyzing Portfolio Batch ({len(batch)} assets)...", expanded=True) as status:
                 
-                for i, target in enumerate(batch):
-                    status.write(f"**({i+1}/5) Analyzing {target}...**")
+                # 1. Fetch ALL Data (Fast)
+                status.write("Fetching market data...")
+                market_data = fetch_market_batch(headers, batch)
+                
+                if market_data:
+                    status.write(f"Data received for {len(market_data)} assets. Sending to AI...")
                     
-                    try:
-                        # 1. Get Data
-                        mkt = requests.get(f"{MARKETS_URL}/{target}", headers=headers).json()
+                    # 2. Send ONE Prompt to AI
+                    decisions = analyze_portfolio_batch(market_data)
+                    
+                    if decisions:
+                        status.write(f"AI found {len(decisions)} opportunities!")
                         
-                        if 'snapshot' in mkt:
-                            snap = mkt['snapshot']
-                            price = snap.get('offer', snap.get('bid', 0))
-                            change = snap.get('dailyChange', 0)
-                            
-                            # 2. Step 1 (Strategy)
-                            strategy = generate_strategy_prompt(target)
-                            if strategy == "RATE_LIMIT":
-                                status.warning("Rate Limit Hit. Cooling down 15s...")
-                                time.sleep(15)
-                                continue
-
-                            # 3. Step 2 (Decision)
-                            decision = analyze_market(strategy, price, change)
-                            
-                            action = decision.get('action', 'WAIT')
-                            
-                            if action == "RATE_LIMIT":
-                                status.warning("Rate Limit Hit. Cooling down...")
-                                time.sleep(15)
-                                continue
-
-                            conf = decision.get('confidence', 0)
-                            reason = decision.get('reason', '-')
+                        for dec in decisions:
+                            asset = dec.get('asset')
+                            action = dec.get('action')
+                            conf = dec.get('confidence', 0)
+                            reason = dec.get('reason', '-')
                             
                             # Add to Log
                             new_log = {
                                 "Time": datetime.now().strftime("%H:%M:%S"),
-                                "Asset": target,
+                                "Asset": asset,
                                 "Action": action,
-                                "Conf": f"{conf}%",
+                                "Conf": conf, # Int for progress bar
                                 "Reason": reason
                             }
                             st.session_state["log_history"].insert(0, new_log)
-                            # Keep log clean (last 20)
-                            if len(st.session_state["log_history"]) > 20:
-                                st.session_state["log_history"].pop()
+                            if len(st.session_state["log_history"]) > 20: st.session_state["log_history"].pop()
                             
-                            # 4. Execute
-                            if action in ["BUY", "SELL"] and conf > 60:
+                            # 3. Execute Lucrative Only
+                            if action in ["BUY", "SELL"] and conf > 70:
                                 if avail > 100:
-                                    status.write(f"🚀 **EXECUTING {action}!**")
-                                    # Sizing: Crypto needs small size (0.01), Stocks need 1
-                                    size = 0.01 if "USD" in target and "BTC" in target else 1
-                                    execute_trade(headers, target, action, size)
-                                    st.toast(f"✅ Trade Sent: {target}")
-                                else:
-                                    st.error("Insufficient Funds")
-                            
-                            # SMART DELAY (12s per asset = 60s total for 5 assets)
-                            # This keeps us under the 15 request/min limit
-                            time.sleep(10) 
-                            
-                    except Exception as e:
-                        status.write(f"Error on {target}: {e}")
+                                    size = 0.01 if "BTC" in asset or "ETH" in asset else 1
+                                    execute_trade(headers, asset, action, size)
+                                    st.toast(f"✅ Executed: {action} {asset}")
+                                    time.sleep(0.5)
+                            else:
+                                status.write(f"Skipping {asset}: {action} (Conf {conf}%) - Not lucrative enough.")
+                    else:
+                        status.write("AI decided NO TRADES for this batch.")
+                
+            # COOLDOWN (60s cycle)
+            # Since we did 1 big call, we just wait 60s.
+            for s in range(60, 0, -1):
+                status_box.info(f"⏳ Next Portfolio Scan in {s}s")
+                time.sleep(1)
             
-            # Loop Reset
             st.rerun()
