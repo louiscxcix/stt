@@ -18,16 +18,13 @@ class CapitalClient:
             self.login = st.secrets["capital_com"]["email"]
             self.password = st.secrets["capital_com"]["password"]
             
-            # --- GEMINI SETUP ---
             genai.configure(api_key=st.secrets["gemini"]["GEMINI_API_KEY"])
             
-            # FORCE MODEL: 2.5 FLASH LITE
-            # We wrap in try/except to catch immediate instantiation errors
+            # FORCE 2.5 FLASH LITE
             try:
                 self.model_name = "gemini-2.5-flash-lite"
                 self.model = genai.GenerativeModel(self.model_name)
             except:
-                # If 2.5 fails, try 2.0 lite as backup
                 self.model_name = "gemini-2.0-flash-lite-preview-02-05"
                 self.model = genai.GenerativeModel(self.model_name)
             
@@ -85,7 +82,7 @@ class CapitalClient:
             r = self.session.get(f"{self.base_url}/api/v1/positions", headers=headers)
             if r.status_code == 200: positions = r.json()['positions']
 
-            r = self.session.get(f"{self.base_url}/api/v1/prices/{epic}?resolution=MINUTE&max=10", headers=headers)
+            r = self.session.get(f"{self.base_url}/api/v1/prices/{epic}?resolution=MINUTE&max=5", headers=headers)
             if r.status_code == 200: 
                 raw = r.json()['prices']
                 for c in raw: candles.append(c['closePrice']['bid'])
@@ -107,50 +104,45 @@ class CapitalClient:
                 self.session.delete(f"{self.base_url}/api/v1/positions/{p['dealId']}", headers=headers)
 
 # ==========================================
-# 2. AI MANAGER (2.5 FLASH LITE)
+# 2. MANIC AI MANAGER (NO HOLDING ALLOWED)
 # ==========================================
 def ask_gemini_aggressive(bot, price, candles):
-    if not candles or len(candles) < 3:
-        return "HOLD", "Waiting for data..."
+    if not candles: return "MICRO BUY", "No Data - Force Entry"
 
     trend_str = " -> ".join([str(c) for c in candles[-5:]]) 
     
     prompt = f"""
-    You are an Ultra-Aggressive Crypto Scalper. 
+    You are a High-Frequency Crypto Trading Bot.
     Asset: ETH/USD. Price: {price}.
-    Last 5m Prices: {trend_str}
+    Recent 5m Trend: {trend_str}
     
-    Analysis Logic:
-    1. If price moved UP in last 2 mins -> MOMENTUM BUY (CORE)
-    2. If price moved DOWN in last 2 mins -> MOMENTUM SELL (CORE)
+    YOUR JOB IS TO TRADE. HOLDING IS FORBIDDEN.
+    
+    Rules:
+    1. If price is moving UP even slightly -> CORE BUY
+    2. If price is moving DOWN even slightly -> CORE SELL
     3. If flat -> Scalp the noise (MICRO BUY/SELL)
     
-    Output strictly: "DECISION | REASON"
-    Options: CORE BUY, CORE SELL, MICRO BUY, MICRO SELL
+    You MUST output strictly: "DECISION | REASON"
+    Valid Decisions: CORE BUY, CORE SELL, MICRO BUY, MICRO SELL
     """
     
-    safety_settings = [
-        {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-        {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-        {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-        {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
-    ]
-
     try:
-        response = bot.model.generate_content(prompt, safety_settings=safety_settings)
+        response = bot.model.generate_content(prompt)
         text = response.text.strip()
         if "|" in text:
             decision, reason = text.split("|", 1)
             return decision.strip().upper(), reason.strip()
-        return "MICRO BUY", "Aggressive Default" 
+        # Fallback if AI hallucinates format
+        return "MICRO BUY", "AI Format Error - Defaulting to Buy"
     except Exception as e:
-        return "HOLD", f"API Error: {str(e)[:40]}"
+        return "MICRO BUY", f"API Fail - Force Buy: {str(e)[:10]}"
 
 # ==========================================
 # 3. DYNAMIC SIZING
 # ==========================================
 def calculate_trade_size(decision, equity, price):
-    if price == 0: return 0
+    if price == 0 or equity == 0: return 0.01 # Fail-safe small size
     
     core_fund = equity * 0.50
     micro_fund = equity * 0.30
@@ -190,9 +182,10 @@ def main():
         st.session_state.bot = CapitalClient()
         st.session_state.connected = False
         st.session_state.active = False
-        st.session_state.last_ai_check = datetime.now() - timedelta(minutes=5) 
+        # Force immediate start
+        st.session_state.last_ai_check = datetime.now() - timedelta(minutes=1) 
         st.session_state.ai_log = []
-        st.session_state.midnight_mode = False
+        st.session_state.cooldown_until = None
 
     bot = st.session_state.bot
 
@@ -206,7 +199,7 @@ def main():
                     st.session_state.connected = True
                     st.rerun()
         else:
-            st.success("System Online")
+            st.success("Connected")
             
             c1, c2 = st.columns(2)
             if st.session_state.active:
@@ -216,12 +209,13 @@ def main():
             else:
                 if c1.button("▶️ START NOW"):
                     st.session_state.active = True
-                    st.session_state.last_ai_check = datetime.now() - timedelta(minutes=5)
+                    # Reset triggers
+                    st.session_state.last_ai_check = datetime.now() - timedelta(minutes=1)
                     st.rerun()
             
             if c2.button("⚠️ CLOSE ALL"):
                 bot.close_all_positions()
-                st.toast("Dumped all positions.")
+                st.toast("Dumped positions.")
 
     st.title("🤖 AI High-Frequency Scalper")
     
@@ -247,25 +241,32 @@ def main():
         margin = account.get('margin', 0)
         pl = account.get('profitLoss', 0)
         
-        reserve_floor = equity * 0.20
-        safe_to_trade = available > reserve_floor
+        # We relaxed the reserve logic to ensure it TRADES.
+        # As long as we have $50, we trade.
+        safe_to_trade = available > 50
         
         now = datetime.now()
+        in_cooldown = st.session_state.cooldown_until and now < st.session_state.cooldown_until
         time_since = (now - st.session_state.last_ai_check).total_seconds()
         
-        if st.session_state.active:
-            # Check Rate Limit (45s safety)
-            if time_since > 45:
+        if st.session_state.active and not in_cooldown:
+            # 10 SECOND LOOP FOR SPEED
+            if time_since > 10:
                 if safe_to_trade:
-                    if len(positions) < 5: 
+                    # Only allow 3 concurrent trades max to prevent explosion
+                    if len(positions) < 3: 
                         decision, reason = ask_gemini_aggressive(bot, price, candles)
                         
-                        timestamp = now.strftime('%H:%M:%S')
-                        log_entry = f"[{timestamp}] {decision}: {reason}"
-                        st.session_state.ai_log.insert(0, log_entry)
-                        st.session_state.last_ai_check = now
-                        
-                        if "BUY" in decision or "SELL" in decision:
+                        if "429" in reason:
+                            st.session_state.cooldown_until = now + timedelta(seconds=60)
+                            st.toast("⚠️ Rate Limit - Cooling 60s")
+                        else:
+                            timestamp = now.strftime('%H:%M:%S')
+                            log_entry = f"[{timestamp}] {decision}: {reason}"
+                            st.session_state.ai_log.insert(0, log_entry)
+                            st.session_state.last_ai_check = now
+                            
+                            # EXECUTE WITHOUT QUESTION
                             side = "BUY" if "BUY" in decision else "SELL"
                             size = calculate_trade_size(decision, equity, price)
                             
@@ -276,14 +277,16 @@ def main():
                                 else:
                                     st.session_state.ai_log.insert(0, f"[{timestamp}] EXEC FAIL: {msg}")
                     else:
-                        st.session_state.ai_log.insert(0, f"[{now.strftime('%H:%M:%S')}] MAX POSITIONS (5). Holding.")
+                        st.session_state.ai_log.insert(0, f"[{now.strftime('%H:%M:%S')}] Max Positions (3). Waiting.")
+                        st.session_state.last_ai_check = now # Reset timer so we don't spam log
                 else:
-                    st.session_state.ai_log.insert(0, "⚠️ LOW CASH RESERVE - Pausing Buys")
+                    st.error(f"LOW FUNDS: ${available} < $50")
 
+        # UI UPDATE
         with header_ph.container():
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("Equity", f"€{equity:,.2f}")
-            c2.metric("Free Funds", f"€{available:,.2f}", delta=f"Floor: €{reserve_floor:.0f}")
+            c2.metric("Free Funds", f"€{available:,.2f}")
             c3.metric("Margin Used", f"€{margin:,.2f}")
             c4.metric("Total P/L", f"€{pl:,.2f}", delta=pl)
 
