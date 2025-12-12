@@ -3,7 +3,6 @@ import requests
 import base64
 import time
 import pandas as pd
-import plotly.graph_objects as go
 import google.generativeai as genai
 from datetime import datetime, timedelta
 from Crypto.PublicKey import RSA
@@ -77,8 +76,8 @@ class CapitalClient:
             r = self.session.get(f"{self.base_url}/api/v1/positions", headers=headers)
             if r.status_code == 200: positions = r.json()['positions']
 
-            # 4. History (15 mins)
-            r = self.session.get(f"{self.base_url}/api/v1/prices/{epic}?resolution=MINUTE&max=15", headers=headers)
+            # 4. History (Short term for scalping)
+            r = self.session.get(f"{self.base_url}/api/v1/prices/{epic}?resolution=MINUTE&max=10", headers=headers)
             if r.status_code == 200: 
                 raw = r.json()['prices']
                 for c in raw: candles.append(c['closePrice']['bid'])
@@ -100,67 +99,62 @@ class CapitalClient:
                 self.session.delete(f"{self.base_url}/api/v1/positions/{p['dealId']}", headers=headers)
 
 # ==========================================
-# 2. AI HEDGE FUND MANAGER
+# 2. AGGRESSIVE AI ENGINE
 # ==========================================
-def ask_gemini_strategy(bot, price, candles):
-    trend_str = " -> ".join([str(c) for c in candles[-10:]])
+def ask_gemini_aggressive(bot, price, candles):
+    # Format trend for the prompt
+    trend_str = " -> ".join([str(c) for c in candles[-5:]])
     
     prompt = f"""
-    Act as a Senior Crypto Hedge Fund Manager. Asset: ETH/USD. Price: {price}.
-    Recent 10m Trend: {trend_str}
+    You are an Aggressive Crypto Scalper running a Hedge Fund.
+    Asset: ETH/USD. Current Price: {price}.
+    Last 5 candles: {trend_str}
     
-    You have two trading desks:
-    1. CORE DESK (Safe, Trend Following)
-    2. MICRO DESK (Aggressive, High Leverage, Volatility Capture)
+    YOUR GOAL: OPEN TRADES. DO NOT BE PASSIVE.
+    You have two modes:
+    1. "CORE BUY/SELL": For clear trends (Safe Sizing).
+    2. "MICRO BUY/SELL": For quick scalps (High Leverage).
     
-    Analyze the market structure.
-    - If strong sustained trend: Signal 'CORE BUY' or 'CORE SELL'.
-    - If high volatility/choppy but clear direction: Signal 'MICRO BUY' or 'MICRO SELL'.
-    - If unclear: Signal 'HOLD'.
+    INSTRUCTIONS:
+    - Look at the last 3 candles. If they moved up, "MICRO BUY".
+    - If they moved down, "MICRO SELL".
+    - Only output "HOLD" if the market is completely flat (zero movement).
+    - Be biased towards ACTION.
     
-    Output strictly one of these 5 options: CORE BUY, CORE SELL, MICRO BUY, MICRO SELL, HOLD.
+    Output ONE command: CORE BUY, CORE SELL, MICRO BUY, MICRO SELL, or HOLD.
     """
     
     try:
         response = bot.model.generate_content(prompt)
         decision = response.text.strip().upper()
-        # Validation
-        valid_cmds = ["CORE BUY", "CORE SELL", "MICRO BUY", "MICRO SELL", "HOLD"]
-        if any(cmd in decision for cmd in valid_cmds):
+        # Fallback if AI hallucinates
+        valid = ["CORE BUY", "CORE SELL", "MICRO BUY", "MICRO SELL", "HOLD"]
+        if any(v in decision for v in valid):
             return decision
-        return "HOLD"
+        return "MICRO BUY" # Default to aggressive buy if confused
     except:
         return "HOLD"
 
 # ==========================================
-# 3. DYNAMIC SIZING ENGINE
+# 3. DYNAMIC SIZING (50/30/20 RULE)
 # ==========================================
 def calculate_trade_size(decision, equity, price):
-    """
-    Auto-calculates trade size based on the 50/30/20 Rule.
-    Risks small % of the specific bucket per trade to survive drawdown.
-    """
-    
-    # 1. Define Buckets
-    core_fund = equity * 0.50
-    micro_fund = equity * 0.30
-    # Reserve (20%) is untouched
+    # Rule Buckets
+    core_bucket = equity * 0.50
+    micro_bucket = equity * 0.30
     
     size = 0.0
     
+    # Risk 5% of the respective bucket per trade to keep it sustainable
     if "CORE" in decision:
-        # Core Strategy: Use 5% of the Core Fund per trade
-        # Standard Leverage (Assumed 1:2 for safety)
-        invest_amount = core_fund * 0.05
-        leverage = 2
-        size = (invest_amount * leverage) / price
+        invest = core_bucket * 0.05
+        lev = 2
+        size = (invest * lev) / price
         
     elif "MICRO" in decision:
-        # Micro Strategy: Use 5% of the Micro Fund per trade
-        # HIGH Leverage (1:10)
-        invest_amount = micro_fund * 0.05
-        leverage = 10
-        size = (invest_amount * leverage) / price
+        invest = micro_bucket * 0.05
+        lev = 10 # High Leverage for Micro
+        size = (invest * lev) / price
         
     return round(size, 2)
 
@@ -168,17 +162,12 @@ def calculate_trade_size(decision, equity, price):
 # 4. STREAMLIT UI
 # ==========================================
 def main():
-    st.set_page_config(page_title="AI Hedge Fund", page_icon="🏦", layout="wide")
+    st.set_page_config(page_title="Active Fund", page_icon="🚀", layout="wide")
     
-    # Custom Dark Mode Styling
     st.markdown("""
         <style>
-        div[data-testid="metric-container"] {
-            background-color: #1E1E1E;
-            border: 1px solid #333;
-            padding: 10px;
-            border-radius: 8px;
-        }
+        div[data-testid="metric-container"] { background-color: #111; border: 1px solid #333; padding: 10px; border-radius: 8px; }
+        .stAlert { background-color: #111; border: 1px solid #333; color: #0f0; }
         </style>
     """, unsafe_allow_html=True)
 
@@ -187,58 +176,50 @@ def main():
         st.session_state.connected = False
         st.session_state.active = False
         st.session_state.last_ai_check = datetime.now() - timedelta(minutes=2)
-        st.session_state.ai_decision = "INITIALIZING"
+        st.session_state.ai_log = "Initializing..."
         st.session_state.midnight_mode = False
 
     bot = st.session_state.bot
 
     # --- SIDEBAR ---
     with st.sidebar:
-        st.title("🏦 Fund Admin")
-        
+        st.title("🚀 Active Fund")
         if not st.session_state.connected:
-            if st.button("🔌 Connect to Broker", type="primary"):
+            if st.button("🔌 Connect", type="primary"):
                 if bot.connect():
                     st.session_state.connected = True
                     st.rerun()
         else:
-            st.success("Connected to Capital.com")
-            
-            st.divider()
-            st.caption("Strategy Allocation:")
-            st.progress(50, text="Core Fund (50%) - Standard")
-            st.progress(30, text="Micro Fund (30%) - 1:10 Lev")
-            st.progress(20, text="Cash Reserve (20%) - Locked")
-            
+            st.success("Connected")
             st.divider()
             c1, c2 = st.columns(2)
             if st.session_state.active:
-                if c1.button("🛑 PAUSE"):
+                if c1.button("🛑 STOP"):
                     st.session_state.active = False
                     st.rerun()
             else:
-                if c1.button("▶️ RUN AI"):
+                if c1.button("▶️ START"):
                     st.session_state.active = True
                     st.rerun()
             
-            if c2.button("⚠️ LIQUIDATE"):
+            if c2.button("⚠️ CLOSE ALL"):
                 bot.close_all_positions()
-                st.toast("Forced Liquidation Executed.")
+                st.toast("Forced Close")
 
-    # --- DASHBOARD ---
-    st.title("🤖 AI Hedge Fund Dashboard")
+    st.title("🤖 High-Frequency AI Manager")
     
     if not st.session_state.connected:
-        st.info("👈 Please connect via Sidebar.")
+        st.info("👈 Connect via Sidebar")
         st.stop()
 
+    # Placeholders
     header_ph = st.empty()
-    status_ph = st.empty()
+    live_log_ph = st.empty() # For "Thinking" stream
     table_ph = st.empty()
 
-    # --- MAIN LOOP ---
+    # --- LOOP ---
     while True:
-        # 1. Live Data
+        # 1. Fetch
         price, account, positions, candles = bot.get_market_data("ETHUSD")
         
         # 2. Metrics
@@ -247,74 +228,73 @@ def main():
         margin = account.get('margin', 0)
         pl = account.get('profitLoss', 0)
         
-        # 3. Strategy Limits
+        # 3. Reserve Check (20% Rule)
         reserve_floor = equity * 0.20
-        safe_to_trade = available > reserve_floor
-        
-        # 4. Midnight Protocol (Close 1m before midnight, wait 5m)
+        can_trade = available > reserve_floor
+
+        # 4. Midnight Protocol
         now = datetime.now()
         if now.hour == 23 and now.minute == 59 and not st.session_state.midnight_mode:
             st.session_state.midnight_mode = True
             bot.close_all_positions()
-            st.toast("🌙 Midnight Protocol Initiated")
+            st.session_state.ai_log = "🌙 Midnight: Closing & Sleeping..."
         
         if st.session_state.midnight_mode and now.hour == 0 and now.minute >= 5:
             st.session_state.midnight_mode = False
-            st.toast("☀️ Morning Protocol: Resuming")
+            st.session_state.ai_log = "☀️ Morning: Waking up..."
 
-        # 5. AI Cycle (Every 60s)
+        # 5. AI LOGIC (Every 15 Seconds - FAST)
         time_since = (now - st.session_state.last_ai_check).total_seconds()
         
-        if st.session_state.active and not st.session_state.midnight_mode and time_since > 60:
-            if safe_to_trade:
-                decision = ask_gemini_strategy(bot, price, candles)
-                st.session_state.ai_decision = decision
-                st.session_state.last_ai_check = now
+        if st.session_state.active and not st.session_state.midnight_mode and time_since > 15:
+            if can_trade:
+                st.session_state.ai_log = f"⚡ Scanning Volatility... Price: ${price}"
                 
-                # Execute if BUY/SELL
+                # Get Decision
+                decision = ask_gemini_aggressive(bot, price, candles)
+                
                 if "BUY" in decision or "SELL" in decision:
                     side = "BUY" if "BUY" in decision else "SELL"
-                    
-                    # DYNAMIC SIZING "Do as you want"
                     size = calculate_trade_size(decision, equity, price)
                     
                     if size > 0:
                         bot.place_order("ETHUSD", side, size)
-                        st.toast(f"🤖 Executed: {decision} | Size: {size} ETH")
+                        st.session_state.ai_log = f"🚀 EXECUTED: {decision} | Size: {size}"
+                        st.toast(f"Trade: {decision}", icon="💸")
+                    else:
+                        st.session_state.ai_log = "⚠️ Signal valid but Size calculated to 0."
+                else:
+                    st.session_state.ai_log = "👀 Market Flat. Holding for breakout."
+                
+                st.session_state.last_ai_check = now
             else:
-                st.session_state.ai_decision = "HOLD (Cash Reserve Hit)"
+                st.session_state.ai_log = f"🛑 LOW CASH. Reserved: €{reserve_floor:.0f}"
 
         # --- UI UPDATE ---
         with header_ph.container():
             c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Total Equity", f"€{equity:,.2f}")
-            c2.metric("Free Funds", f"€{available:,.2f}", delta=f"Floor: €{reserve_floor:.0f}")
-            c3.metric("Margin Used", f"€{margin:,.2f}")
-            c4.metric("Total P/L", f"€{pl:,.2f}", delta=pl)
+            c1.metric("Equity", f"€{equity:,.2f}")
+            c2.metric("Free Cash", f"€{available:,.2f}", delta=f"Floor: €{reserve_floor:.0f}")
+            c3.metric("Used Margin", f"€{margin:,.2f}")
+            c4.metric("Live P/L", f"€{pl:,.2f}", delta=pl)
 
-        with status_ph.container():
-            s1, s2 = st.columns([1, 4])
-            mode = "ACTIVE" if st.session_state.active else "PAUSED"
-            if st.session_state.midnight_mode: mode = "MIDNIGHT WAIT"
-            
-            s1.info(f"**Bot Mode:** {mode}")
-            s2.success(f"🧠 **Gemini Strategy:** {st.session_state.ai_decision} (Updated: {st.session_state.last_ai_check.strftime('%H:%M:%S')})")
+        # LIVE LOG STREAM
+        live_log_ph.info(f"**AI FEED:** {st.session_state.ai_log}")
 
-        # Active Positions Table
-        trade_list = []
+        # TABLE
+        trades = []
         for p in positions:
-            trade_list.append({
-                "Asset": p.get('epic'),
-                "Direction": p.get('direction'),
+            trades.append({
+                "Type": p.get('direction'),
                 "Size": p.get('size'),
                 "Entry": p.get('openPrice'),
-                "Live P/L": f"€{p.get('profitAndLoss'):.2f}"
+                "P/L": f"€{p.get('profitAndLoss'):.2f}"
             })
         
-        if trade_list:
-            table_ph.dataframe(pd.DataFrame(trade_list), use_container_width=True)
+        if trades:
+            table_ph.dataframe(pd.DataFrame(trades), use_container_width=True)
         else:
-            table_ph.info("No Active Positions. AI is scanning...")
+            table_ph.text("Searching for entries...")
 
         time.sleep(1)
 
